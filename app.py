@@ -664,7 +664,18 @@ def api_update_asset(asset_id, payload):
     with CONN_LOCK:
         CONN.execute(f"UPDATE assets SET {', '.join(fields)} WHERE id = ?", args)
         CONN.commit()
-    return api_get_asset(asset_id)
+
+    updated = api_get_asset(asset_id)
+    # Live surgical single-cell write back to Master Excel
+    try:
+        import sync_excel
+        master_xlsx = "/Users/don/Desktop/1. Master Inspection Plan - Updated 4-6-2026.xlsx"
+        if os.path.exists(master_xlsx) and updated:
+            sync_excel.sync_single_asset_to_excel(master_xlsx, updated, payload)
+    except Exception:
+        pass
+
+    return updated
 
 
 def api_create_asset(payload):
@@ -733,7 +744,24 @@ def api_add_log(asset_id, payload):
             params.append(asset_id)
             CONN.execute(f"UPDATE assets SET {', '.join(updates)} WHERE id = ?", params)
         CONN.commit()
-    return api_get_asset(asset_id)
+
+    updated = api_get_asset(asset_id)
+    # Live surgical single-cell write back to Master Excel
+    try:
+        import sync_excel
+        master_xlsx = "/Users/don/Desktop/1. Master Inspection Plan - Updated 4-6-2026.xlsx"
+        if os.path.exists(master_xlsx) and updated:
+            field_changes = {}
+            if insp_date:
+                field_changes["date_osi_last" if is_osi else "date_internal_last"] = insp_date
+            if next_due:
+                field_changes["date_osi_next" if is_osi else "date_internal_next"] = next_due
+            if field_changes:
+                sync_excel.sync_single_asset_to_excel(master_xlsx, updated, field_changes)
+    except Exception:
+        pass
+
+    return updated
 
 
 def api_export_csv(params):
