@@ -3,157 +3,238 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Master Inspection Plan</title>
-<meta name="description" content="Track equipment inspections, overdue items, and generate yearly inspection plans.">
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔧</text></svg>">
+<title>Master Inspection Plan — Integrity & Inspection Management</title>
+<meta name="description" content="Track equipment inspections, RBI risk profiles, CUI threats, overdue items, and generate yearly inspection plans.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=Roboto+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <div id="app">
 
+  <!-- TOPBAR -->
   <header class="topbar">
     <div class="brand">
-      <span class="brand-mark">MIP</span>
-      <span class="brand-name">Master Inspection Plan</span>
+      <div class="brand-icon">MIP</div>
+      <div class="brand-text">
+        <span class="brand-name">Master Inspection Plan</span>
+        <span class="brand-sub">Asset Integrity & NDT Management</span>
+      </div>
     </div>
+
     <nav class="tabs" id="tabs">
-      <button class="tab active" data-view="dashboard">Dashboard</button>
-      <button class="tab" data-view="assets">Assets Inventory</button>
-      <button class="tab" data-view="critical">Critical Replacements</button>
-      <button class="tab" data-view="temprepairs">Temporary Repairs</button>
-      <button class="tab" data-view="yearly">Yearly Plan</button>
+      <button class="tab active" data-view="dashboard">
+        <span class="tab-icon">📊</span> Dashboard
+      </button>
+      <button class="tab" data-view="assets">
+        <span class="tab-icon">📋</span> Assets Inventory
+      </button>
+      <button class="tab" data-view="critical">
+        <span class="tab-icon">⚡</span> Critical Turnaround
+      </button>
+      <button class="tab" data-view="temprepairs">
+        <span class="tab-icon">🩹</span> Temporary Repairs
+      </button>
+      <button class="tab" data-view="yearly">
+        <span class="tab-icon">📅</span> Yearly Plan
+      </button>
     </nav>
+
     <div class="topbar-actions">
       <input type="file" id="excelFilePicker" accept=".xlsx,.xls" style="display:none">
-      <button id="btnReimport" class="btn ghost">Re-import Excel</button>
-      <button id="btnExport" class="btn ghost">Export CSV</button>
-      <button id="btnNewAsset" class="btn primary">+ New Asset</button>
+      <button id="btnReimport" class="btn ghost" title="Upload and re-import Master Inspection Plan Excel workbook">
+        <span>🔄</span> Re-import Excel
+      </button>
+      <button id="btnExport" class="btn ghost" title="Export current filtered view to CSV">
+        <span>📥</span> Export CSV
+      </button>
+      <button id="btnNewAsset" class="btn primary" title="Add a new asset manually">
+        <span>+</span> New Asset
+      </button>
     </div>
   </header>
 
+  <!-- MAIN CONTENT AREA -->
   <main id="main">
 
-    <!-- DASHBOARD -->
+    <!-- DASHBOARD VIEW -->
     <section id="view-dashboard" class="view active">
       <div class="stat-row" id="statRow"></div>
 
       <div class="panel-grid">
         <div class="panel">
           <div class="panel-head">
-            <h2>High Risk Equipment (API 580)</h2>
-            <span class="hint">Critical equipment requiring priority inspection & evaluation</span>
+            <div>
+              <h2>High Risk Equipment (API 580 / RBI)</h2>
+              <span class="hint">Priority equipment requiring frequent evaluation & surveillance</span>
+            </div>
+            <span class="badge-count" id="highRiskCountBadge">0</span>
           </div>
-          <div id="highRiskList" class="asset-table-wrap"></div>
+          <div id="highRiskList" class="asset-table-wrap compact"></div>
         </div>
+
         <div class="panel">
           <div class="panel-head">
-            <h2>Overdue Inspections</h2>
-            <span class="hint">Next OSI or Internal due date already passed</span>
+            <div>
+              <h2>Overdue Inspections</h2>
+              <span class="hint">Scheduled Next OSI or Internal due date has already passed</span>
+            </div>
+            <span class="badge-count danger" id="overdueCountBadge">0</span>
           </div>
-          <div id="overdueList" class="asset-table-wrap"></div>
+          <div id="overdueList" class="asset-table-wrap compact"></div>
         </div>
       </div>
 
       <div class="panel-grid">
         <div class="panel">
           <div class="panel-head">
-            <h2>Temporary Repairs Expiration Alert</h2>
-            <span class="hint">Clamps & composite wraps approaching/past expiration</span>
+            <div>
+              <h2>Temporary Repairs Expiration Alert</h2>
+              <span class="hint">Clamps, composite wraps & leak seal enclosures approaching expiration</span>
+            </div>
+            <span class="badge-count warning" id="tempRepairsCountBadge">0</span>
           </div>
-          <div id="tempRepairsWidgetList" class="asset-table-wrap"></div>
+          <div id="tempRepairsWidgetList" class="asset-table-wrap compact"></div>
         </div>
+
         <div class="panel">
           <div class="panel-head">
-            <h2>Pending Critical Replacements</h2>
-            <span class="hint">Corroded Sch 40 joints & nozzles scheduled for turnaround replacement</span>
+            <div>
+              <h2>Pending Critical Replacements</h2>
+              <span class="hint">Corroded Sch 40 joints & turnaround scope requiring replacement</span>
+            </div>
+            <span class="badge-count" id="criticalCountBadge">0</span>
           </div>
-          <div id="criticalWidgetList" class="asset-table-wrap"></div>
+          <div id="criticalWidgetList" class="asset-table-wrap compact"></div>
         </div>
       </div>
 
       <div class="panel">
         <div class="panel-head">
-          <h2>Asset Distribution by Source Sheet</h2>
-          <span class="hint">System & Equipment Class breakdown</span>
+          <div>
+            <h2>Asset Distribution by System & Source Sheet</h2>
+            <span class="hint">Click any sheet to immediately filter inventory</span>
+          </div>
         </div>
         <div id="bySheet" class="chip-row"></div>
       </div>
     </section>
 
-    <!-- ASSETS -->
+    <!-- ASSETS INVENTORY VIEW -->
     <section id="view-assets" class="view">
       <div class="toolbar">
-        <input id="searchBox" type="text" placeholder="Search name, tag, asset #, fluid service, remarks…">
-        <select id="sheetFilter"><option value="">All sheets</option></select>
+        <div class="search-input-wrap">
+          <span class="search-icon">🔍</span>
+          <input id="searchBox" type="text" placeholder="Search equipment name, tag, asset #, fluid, pack, remarks…">
+          <button id="btnClearSearch" class="btn-clear" style="display:none;" title="Clear search">✕</button>
+        </div>
+        
+        <select id="sheetFilter">
+          <option value="">All Sheets (16 Systems)</option>
+        </select>
+        
         <select id="riskFilter">
           <option value="">All Risk Levels</option>
           <option value="HIGH">High Risk</option>
           <option value="MEDIUM">Medium Risk</option>
           <option value="LOW">Low Risk</option>
         </select>
+
         <select id="groupFilter">
           <option value="">No Grouping</option>
-          <option value="field">Group by Pack #</option>
-          <option value="location">Group by Location</option>
-          <option value="plant">Group by Plant/Facility</option>
+          <option value="field">Group by Pack # / Header</option>
           <option value="source_sheet">Group by Source Sheet</option>
+          <option value="plant">Group by Plant / Facility</option>
+          <option value="location">Group by Location</option>
         </select>
-        <label class="checkbox"><input type="checkbox" id="overdueOnly"> Overdue only</label>
+
+        <label class="checkbox">
+          <input type="checkbox" id="overdueOnly"> Overdue Only
+        </label>
+
+        <button id="btnResetFilters" class="btn ghost small" title="Reset all search filters">Reset</button>
       </div>
+
+      <div class="table-meta-bar">
+        <span id="assetCountText" class="count-text">Loading assets…</span>
+        <div class="pagination-controls" id="paginationControls">
+          <label for="pageSizeSelect">Rows:</label>
+          <select id="pageSizeSelect">
+            <option value="50">50</option>
+            <option value="100">100</option>
+            <option value="200">200</option>
+            <option value="all">All</option>
+          </select>
+          <button id="btnPrevPage" class="btn ghost small" disabled>◀ Prev</button>
+          <span id="pageIndicator" class="page-indicator">Page 1 of 1</span>
+          <button id="btnNextPage" class="btn ghost small" disabled>Next ▶</button>
+        </div>
+      </div>
+
       <div id="assetsTableWrap" class="asset-table-wrap full"></div>
     </section>
 
-    <!-- CRITICAL REPLACEMENTS -->
+    <!-- CRITICAL TURNAROUND VIEW -->
     <section id="view-critical" class="view">
       <div class="toolbar">
-        <input id="criticalSearch" type="text" placeholder="Search critical replacement scope, pack #, report #…">
+        <div class="search-input-wrap">
+          <span class="search-icon">🔍</span>
+          <input id="criticalSearch" type="text" placeholder="Search critical replacement scope, pack #, report #…">
+        </div>
         <select id="criticalDoneFilter">
-          <option value="">All Statuses</option>
-          <option value="No">Pending Replacement</option>
-          <option value="Yes">Completed Replacement</option>
+          <option value="">All Replacement Statuses</option>
+          <option value="No">Pending Replacement (No)</option>
+          <option value="Yes">Completed Replacement (Yes)</option>
         </select>
+        <span id="criticalCountText" class="count-text" style="margin-left:auto;"></span>
       </div>
       <div id="criticalTableWrap" class="asset-table-wrap full"></div>
     </section>
 
-    <!-- TEMPORARY REPAIRS -->
+    <!-- TEMPORARY REPAIRS VIEW -->
     <section id="view-temprepairs" class="view">
       <div class="toolbar">
-        <input id="tempRepairSearch" type="text" placeholder="Search area, asset, repaired section, contractor, report #…">
+        <div class="search-input-wrap">
+          <span class="search-icon">🔍</span>
+          <input id="tempRepairSearch" type="text" placeholder="Search area, asset, repaired section, contractor, report #…">
+        </div>
         <select id="tempRepairStatusFilter">
           <option value="">All Statuses</option>
           <option value="Expired">Expired Repairs</option>
-          <option value="Valid">Valid / Active</option>
+          <option value="Active">Active / Valid</option>
           <option value="Replaced">Permanently Replaced</option>
         </select>
+        <span id="tempRepairCountText" class="count-text" style="margin-left:auto;"></span>
       </div>
       <div id="tempRepairsTableWrap" class="asset-table-wrap full"></div>
     </section>
 
-    <!-- YEARLY PLAN -->
+    <!-- YEARLY PLAN VIEW -->
     <section id="view-yearly" class="view">
       <div class="toolbar">
-        <label>Year</label>
-        <input id="yearInput" type="number" style="width:100px">
+        <label for="yearInput" style="font-weight:600;">Plan Year:</label>
+        <input id="yearInput" type="number" min="2020" max="2040" style="width:110px;">
         <button id="btnLoadYear" class="btn primary">Generate Plan</button>
-        <button id="btnPrintYear" class="btn ghost">Print</button>
+        <button id="btnPrintYear" class="btn ghost">🖨️ Print Report</button>
+        <span id="yearlyMeta" class="count-text" style="margin-left:auto;"></span>
       </div>
-      <div id="yearlyMeta" class="hint" style="margin: 8px 0 16px;"></div>
       <div id="yearlyTableWrap" class="asset-table-wrap full"></div>
     </section>
 
   </main>
 </div>
 
-<!-- Asset detail / edit drawer -->
+<!-- SLIDE-OVER ASSET DRAWER -->
 <div id="drawerOverlay" class="drawer-overlay">
   <div id="drawer" class="drawer">
     <div class="drawer-head">
-      <h2 id="drawerTitle">Asset</h2>
-      <button id="drawerClose" class="btn ghost small">Close</button>
+      <div class="drawer-title-wrap">
+        <h2 id="drawerTitle">Asset Details</h2>
+        <span id="drawerSubtitle" class="drawer-subtitle"></span>
+      </div>
+      <button id="drawerClose" class="btn ghost small" title="Close drawer">✕</button>
     </div>
     <div id="drawerBody" class="drawer-body"></div>
   </div>

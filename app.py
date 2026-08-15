@@ -39,6 +39,12 @@ if not os.path.exists(DB_PATH):
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # Enable WAL mode for better concurrency
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
+    
     # Auto-migrate schema for AIMS columns if missing
     cur = conn.cursor()
     asset_cols = [r[1] for r in cur.execute("PRAGMA table_info(assets)").fetchall()]
@@ -92,7 +98,7 @@ def row_to_dict(row):
     # Calculate CUI (Corrosion Under Insulation) susceptibility:
     # Operating temperature between 10C and 175C (or 50F to 350F) with Insulation present
     insul = str(d.get("insulation") or "").strip().lower()
-    has_insulation = insul not in ("", "none", "no", "n/a", "0")
+    has_insulation = insul not in ("", "none", "no", "n/a", "0", "false")
     
     op_temp_str = str(d.get("operating_temp") or "")
     op_temp_val = None
@@ -117,7 +123,6 @@ def row_to_dict(row):
     # Risk Category default assignment if missing
     risk = str(d.get("risk_category") or "").strip().upper()
     if risk not in ("HIGH", "MEDIUM", "LOW"):
-        # Infer default risk if remaining life < 5 yrs or overdue
         rl_str = str(d.get("remaining_life") or "")
         try:
             rl_val = float(re.search(r"(\d+(?:\.\d+)?)", rl_str).group(1)) if re.search(r"(\d+(?:\.\d+)?)", rl_str) else None
@@ -154,11 +159,22 @@ def api_list_assets(params):
     args = []
     
     if q:
-        # FTS5 matches tokens. If they search "pump", we want "pump*".
-        # We replace double quotes to prevent syntax errors.
-        safe_q = q.replace('"', '""')
-        sql = "SELECT * FROM assets WHERE id IN (SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?) "
-        args.append(f'"{safe_q}"*')
+        # Robust FTS5 tokenization
+        tokens = [t for t in re.findall(r"[\w]+", q) if t]
+        if tokens:
+            fts_query = " ".join([f'"{t}"*' for t in tokens])
+            try:
+                sql = "SELECT * FROM assets WHERE id IN (SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?) "
+                args.append(fts_query)
+            except Exception:
+                # Fallback to standard LIKE
+                sql = "SELECT * FROM assets WHERE (name LIKE ? OR tag LIKE ? OR asset_number LIKE ? OR remarks LIKE ? OR fluid_service LIKE ? OR field LIKE ?) "
+                pattern = f"%{q}%"
+                args = [pattern] * 6
+        else:
+            sql = "SELECT * FROM assets WHERE (name LIKE ? OR tag LIKE ? OR asset_number LIKE ? OR remarks LIKE ?) "
+            pattern = f"%{q}%"
+            args = [pattern] * 4
 
     if not include_archived:
         sql += " AND archived = 0"
@@ -167,7 +183,20 @@ def api_list_assets(params):
         args.append(sheet)
 
     with CONN_LOCK:
-        rows = [row_to_dict(r) for r in CONN.execute(sql, args).fetchall()]
+        try:
+            raw_rows = CONN.execute(sql, args).fetchall()
+        except sqlite3.OperationalError:
+            # Fallback if FTS table syntax issue occurred
+            sql_fallback = "SELECT * FROM assets WHERE (name LIKE ? OR tag LIKE ? OR asset_number LIKE ? OR remarks LIKE ?) "
+            if not include_archived:
+                sql_fallback += " AND archived = 0"
+            if sheet:
+                sql_fallback += " AND source_sheet = ?"
+                raw_rows = CONN.execute(sql_fallback, [f"%{q}%"] * 4 + [sheet]).fetchall()
+            else:
+                raw_rows = CONN.execute(sql_fallback, [f"%{q}%"] * 4).fetchall()
+
+        rows = [row_to_dict(r) for r in raw_rows]
 
     if overdue_only:
         rows = [r for r in rows if r["overdue"]]
@@ -354,7 +383,6 @@ def api_update_asset(asset_id, payload):
     fields, args = [], []
     for col in ASSET_COLUMNS:
         if col in payload:
-            assert col in ASSET_COLUMNS, f"Unexpected column: {col}"
             fields.append(f"{col} = ?")
             args.append(payload[col])
     if "extra" in payload:
@@ -372,7 +400,6 @@ def api_update_asset(asset_id, payload):
 
 
 def api_create_asset(payload):
-    # Ensure source_sheet has a default, then build column list (no duplicates)
     payload.setdefault("source_sheet", "Manual Entry")
     cols = [c for c in ASSET_COLUMNS if c in payload]
     vals = [payload[c] for c in cols]
@@ -389,24 +416,24 @@ def api_create_asset(payload):
 
 def _validate_iso_date(value, field_name):
     """Return the value if it's a valid YYYY-MM-DD string, else raise."""
-    if value is None:
+    if value is None or str(value).strip() == "":
         return None
-    if not ISO_DATE_RE.match(str(value)):
-        raise ValueError(f"Invalid date for {field_name}: expected YYYY-MM-DD, got '{value}'")
-    return str(value)
+    val_str = str(value).strip()
+    if not ISO_DATE_RE.match(val_str):
+        raise ValueError(f"Invalid date for {field_name}: expected YYYY-MM-DD, got '{val_str}'")
+    return val_str
 
 
 def api_add_log(asset_id, payload):
     insp_date = _validate_iso_date(payload.get("insp_date"), "insp_date")
     next_due = _validate_iso_date(payload.get("next_due_date"), "next_due_date")
-    insp_type = (payload.get("insp_type") or "").upper()
+    insp_type = (payload.get("insp_type") or "OSI").upper()
     inspector_name = payload.get("inspector_name")
     insp_method = payload.get("insp_method")
     t_actual = payload.get("t_actual")
     action_required = payload.get("action_required")
     
     with CONN_LOCK:
-        # Ensure table columns exist
         try:
             CONN.execute("ALTER TABLE inspection_log ADD COLUMN inspector_name TEXT")
             CONN.execute("ALTER TABLE inspection_log ADD COLUMN insp_method TEXT")
@@ -421,10 +448,7 @@ def api_add_log(asset_id, payload):
             (asset_id, insp_date, payload.get("insp_type"),
              payload.get("findings"), next_due, inspector_name, insp_method, t_actual, action_required))
         
-        # Determine whether this is OSI or Internal inspection
         is_osi = "OSI" in insp_type
-        
-        # Build update for asset
         updates = []
         params = []
         
@@ -437,10 +461,6 @@ def api_add_log(asset_id, payload):
             next_field = "date_osi_next" if is_osi else "date_internal_next"
             updates.append(f"{next_field} = ?")
             params.append(next_due)
-        else:
-            # If no new next due date provided, clear next due date for this type so it isn't marked overdue
-            next_field = "date_osi_next" if is_osi else "date_internal_next"
-            updates.append(f"{next_field} = NULL")
 
         if updates:
             params.append(asset_id)
@@ -464,10 +484,7 @@ def api_export_csv(params):
         writer.writeheader()
         return out.getvalue()
 
-    # Collect standard base columns excluding extra_json
     base_cols = [c for c in rows[0].keys() if c != "extra_json"]
-    
-    # Collect all unique extra_json keys across all rows
     extra_keys = []
     parsed_extras = []
     for r in rows:
@@ -601,7 +618,6 @@ MIME_OVERRIDES = {
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
-        # Quiet normal traffic, but still print errors (status >= 400)
         try:
             status = int(args[1]) if len(args) > 1 else 0
         except (ValueError, IndexError):
@@ -682,7 +698,6 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
             else:
-                # Serve static files from STATIC_DIR (js, css, images, etc.)
                 safe = os.path.normpath(path.lstrip("/"))
                 if ".." not in safe:
                     full = os.path.join(STATIC_DIR, safe)
@@ -757,7 +772,6 @@ def main():
             break
         except OSError as err:
             if err.errno == 48 or getattr(err, "winerror", None) == 10048 or "Address already in use" in str(err):
-                # Check if an instance is already running
                 if attempt == 0:
                     try:
                         import urllib.request
