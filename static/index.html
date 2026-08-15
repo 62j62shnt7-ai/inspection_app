@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Master Inspection Plan — Integrity & Inspection Management</title>
-<meta name="description" content="Track equipment inspections, RBI risk profiles, CUI threats, overdue items, and generate yearly inspection plans.">
+<title>Master Inspection Plan — Asset Integrity & RBI Suite</title>
+<meta name="description" content="API 580/510/570 Asset Integrity Management, Overdue Triage, RBI 5x5 Matrix, Remaining Life Calculator, and Deferral Governance.">
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🛡️</text></svg>">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -20,13 +20,13 @@
       <div class="brand-icon">MIP</div>
       <div class="brand-text">
         <span class="brand-name">Master Inspection Plan</span>
-        <span class="brand-sub">Asset Integrity & NDT Management</span>
+        <span class="brand-sub">Asset Integrity & RBI Suite</span>
       </div>
     </div>
 
     <nav class="tabs" id="tabs">
       <button class="tab active" data-view="dashboard">
-        <span class="tab-icon">📊</span> Dashboard
+        <span class="tab-icon">📊</span> Executive Dashboard
       </button>
       <button class="tab" data-view="assets">
         <span class="tab-icon">📋</span> Assets Inventory
@@ -61,61 +61,102 @@
 
     <!-- DASHBOARD VIEW -->
     <section id="view-dashboard" class="view active">
+      
+      <!-- Executive Compliance Metrics Banner -->
+      <div class="compliance-banner" id="complianceBanner">
+        <div class="compliance-metric">
+          <div class="metric-val" id="kpiComplianceRate">--%</div>
+          <div class="metric-lbl">Inspection Compliance Index</div>
+        </div>
+        <div class="compliance-divider"></div>
+        <div class="compliance-metric">
+          <div class="metric-val text-red" id="kpiUnmanagedOverdue">--</div>
+          <div class="metric-lbl">Unmanaged Overdue Backlog</div>
+        </div>
+        <div class="compliance-divider"></div>
+        <div class="compliance-metric">
+          <div class="metric-val text-amber" id="kpiApprovedDeferrals">--</div>
+          <div class="metric-lbl">Approved MOC Deferrals</div>
+        </div>
+        <div class="compliance-divider"></div>
+        <div class="compliance-metric">
+          <div class="metric-val text-purple" id="kpiCuiCount">--</div>
+          <div class="metric-lbl">CUI Target Lines</div>
+        </div>
+      </div>
+
+      <!-- Stat Cards -->
       <div class="stat-row" id="statRow"></div>
 
+      <!-- Overdue Aging Triage Bar -->
+      <div class="panel overdue-triage-panel">
+        <div class="panel-head">
+          <div>
+            <h2>⏳ Overdue Inspection Aging Triage (Risk-Ranked Backlog)</h2>
+            <span class="hint">Click any aging bucket to immediately inspect and triage compliance risk</span>
+          </div>
+        </div>
+        <div class="triage-grid" id="triageGrid"></div>
+      </div>
+
+      <!-- 5x5 RBI Matrix + High Risk Queue -->
+      <div class="panel-grid matrix-grid-layout">
+        <!-- 5x5 RBI Risk Matrix -->
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>📊 API 580 / RBI 5×5 Risk Matrix</h2>
+              <span class="hint">Click any cell or tier to filter assets by risk ranking</span>
+            </div>
+            <button class="btn ghost small" id="btnResetMatrixFilter" style="display:none;" onclick="clearMatrixFilter()">Reset Filter</button>
+          </div>
+          <div class="rbi-matrix-container" id="rbiMatrixContainer"></div>
+        </div>
+
+        <!-- High Risk Equipment Panel -->
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>🛡️ Critical High Risk Equipment (Tier 1 Priority)</h2>
+              <span class="hint">RBI High Risk items requiring prioritized thickness monitoring</span>
+            </div>
+            <span class="badge-count danger" id="highRiskCountBadge">0</span>
+          </div>
+          <div id="highRiskList" class="asset-table-wrap compact"></div>
+        </div>
+      </div>
+
+      <!-- Alerts: Overdue vs Temp Repairs vs Critical -->
       <div class="panel-grid">
         <div class="panel">
           <div class="panel-head">
             <div>
-              <h2>High Risk Equipment (API 580 / RBI)</h2>
-              <span class="hint">Priority equipment requiring frequent evaluation & surveillance</span>
-            </div>
-            <span class="badge-count" id="highRiskCountBadge">0</span>
-          </div>
-          <div id="highRiskList" class="asset-table-wrap compact"></div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head">
-            <div>
-              <h2>Overdue Inspections</h2>
-              <span class="hint">Scheduled Next OSI or Internal due date has already passed</span>
+              <h2>🚨 Overdue Inspections Queue</h2>
+              <span class="hint">Scheduled Next OSI or Internal due date has passed</span>
             </div>
             <span class="badge-count danger" id="overdueCountBadge">0</span>
           </div>
           <div id="overdueList" class="asset-table-wrap compact"></div>
         </div>
-      </div>
 
-      <div class="panel-grid">
         <div class="panel">
           <div class="panel-head">
             <div>
-              <h2>Temporary Repairs Expiration Alert</h2>
-              <span class="hint">Clamps, composite wraps & leak seal enclosures approaching expiration</span>
+              <h2>🩹 Temporary Repairs Expiration Alert</h2>
+              <span class="hint">Composite wraps & leak seal enclosures approaching expiration</span>
             </div>
             <span class="badge-count warning" id="tempRepairsCountBadge">0</span>
           </div>
           <div id="tempRepairsWidgetList" class="asset-table-wrap compact"></div>
         </div>
-
-        <div class="panel">
-          <div class="panel-head">
-            <div>
-              <h2>Pending Critical Replacements</h2>
-              <span class="hint">Corroded Sch 40 joints & turnaround scope requiring replacement</span>
-            </div>
-            <span class="badge-count" id="criticalCountBadge">0</span>
-          </div>
-          <div id="criticalWidgetList" class="asset-table-wrap compact"></div>
-        </div>
       </div>
 
+      <!-- Sheet Distribution -->
       <div class="panel">
         <div class="panel-head">
           <div>
             <h2>Asset Distribution by System & Source Sheet</h2>
-            <span class="hint">Click any sheet to immediately filter inventory</span>
+            <span class="hint">Click any sheet chip to immediately view and filter assets</span>
           </div>
         </div>
         <div id="bySheet" class="chip-row"></div>
@@ -140,6 +181,23 @@
           <option value="HIGH">High Risk</option>
           <option value="MEDIUM">Medium Risk</option>
           <option value="LOW">Low Risk</option>
+        </select>
+
+        <select id="agingFilter">
+          <option value="">All Due Statuses</option>
+          <option value="0_30">Overdue (0–30 Days)</option>
+          <option value="31_90">Overdue (31–90 Days)</option>
+          <option value="91_180">Overdue (91–180 Days)</option>
+          <option value="180_plus">Overdue (>180 Days Critical)</option>
+          <option value="current">On Schedule / Current</option>
+        </select>
+
+        <select id="deferralFilter">
+          <option value="">All Deferral Statuses</option>
+          <option value="deferred">Approved Deferrals (MOC)</option>
+          <option value="unmanaged">Unmanaged Overdue (Audit Risk)</option>
+          <option value="under review">Under Review</option>
+          <option value="expired">Expired Deferrals</option>
         </select>
 
         <select id="groupFilter">
@@ -174,6 +232,20 @@
       </div>
 
       <div id="assetsTableWrap" class="asset-table-wrap full"></div>
+
+      <!-- Floating Batch Action Bar -->
+      <div id="batchActionBar" class="batch-action-bar">
+        <div class="batch-info">
+          <span class="batch-badge" id="selectedCountBadge">0</span>
+          <span id="selectedCountText">assets selected</span>
+        </div>
+        <div class="batch-actions">
+          <button class="btn primary small" id="btnOpenBulkLog">⚡ Bulk Log Inspection</button>
+          <button class="btn ghost small" id="btnOpenBulkDeferral">🛡️ Bulk Deferral (MOC)</button>
+          <button class="btn ghost small" id="btnExportSelected">📥 Export Selected</button>
+          <button class="btn ghost small" id="btnClearSelection">✕ Clear</button>
+        </div>
+      </div>
     </section>
 
     <!-- CRITICAL TURNAROUND VIEW -->
@@ -185,7 +257,7 @@
         </div>
         <select id="criticalDoneFilter">
           <option value="">All Replacement Statuses</option>
-          <option value="No">Pending Replacement (No)</option>
+          <option value="No">Pending Turnaround Scope (No)</option>
           <option value="Yes">Completed Replacement (Yes)</option>
         </select>
         <span id="criticalCountText" class="count-text" style="margin-left:auto;"></span>
@@ -217,7 +289,7 @@
         <label for="yearInput" style="font-weight:600;">Plan Year:</label>
         <input id="yearInput" type="number" min="2020" max="2040" style="width:110px;">
         <button id="btnLoadYear" class="btn primary">Generate Plan</button>
-        <button id="btnPrintYear" class="btn ghost">🖨️ Print Report</button>
+        <button id="btnPrintYear" class="btn ghost">🖨️ Print Outage Report</button>
         <span id="yearlyMeta" class="count-text" style="margin-left:auto;"></span>
       </div>
       <div id="yearlyTableWrap" class="asset-table-wrap full"></div>
@@ -237,6 +309,122 @@
       <button id="drawerClose" class="btn ghost small" title="Close drawer">✕</button>
     </div>
     <div id="drawerBody" class="drawer-body"></div>
+  </div>
+</div>
+
+<!-- BULK INSPECTION LOG MODAL -->
+<div id="bulkLogModal" class="modal-overlay">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>⚡ Bulk Log Inspection Activity</h3>
+      <button class="modal-close" onclick="closeBulkModals()">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-subtext">Apply inspection record and update next due dates for <b id="bulkLogCountText">0</b> selected assets.</p>
+      
+      <div class="field-grid">
+        <div class="field">
+          <label>Inspection Date</label>
+          <input id="bulkLogDate" type="date">
+        </div>
+        <div class="field">
+          <label>Inspection Type</label>
+          <select id="bulkLogType">
+            <option value="OSI">OSI (On-Stream Inspection)</option>
+            <option value="Internal">Internal Inspection</option>
+            <option value="OSI-ADV">OSI Advanced NDT (PAUT/TOFD)</option>
+            <option value="NDT UT Thickness">NDT UT Wall Thickness</option>
+            <option value="Visual / CUI">Visual / CUI Surveillance</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="field-grid">
+        <div class="field">
+          <label>Inspector Name & Cert #</label>
+          <input id="bulkLogInspector" placeholder="e.g. M. Ahmed (API 570 #4421)">
+        </div>
+        <div class="field">
+          <label>NDT Method</label>
+          <input id="bulkLogMethod" placeholder="e.g. Digital UT Grid, MPT">
+        </div>
+      </div>
+
+      <div class="field-grid wide">
+        <div class="field">
+          <label>Findings & Summary Remarks</label>
+          <textarea id="bulkLogFindings" placeholder="Document general condition, thickness acceptability, coating integrity…"></textarea>
+        </div>
+      </div>
+
+      <div class="field-grid">
+        <div class="field">
+          <label>Next Scheduled Due Date (YYYY-MM-DD)</label>
+          <input id="bulkLogNextDue" type="date">
+        </div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeBulkModals()">Cancel</button>
+      <button class="btn primary" id="btnSubmitBulkLog">💾 Apply Bulk Inspection</button>
+    </div>
+  </div>
+</div>
+
+<!-- BULK DEFERRAL MODAL -->
+<div id="bulkDeferralModal" class="modal-overlay">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>🛡️ Bulk Inspection Deferral (MOC Concession)</h3>
+      <button class="modal-close" onclick="closeBulkModals()">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-subtext">Apply formal engineering concession & risk mitigation for <b id="bulkDeferralCountText">0</b> selected assets.</p>
+
+      <div class="field-grid">
+        <div class="field">
+          <label>Deferral Status</label>
+          <select id="bulkDefStatus">
+            <option value="Approved">Approved (Formal Concession)</option>
+            <option value="Under Review">Under Review / MOC Pending</option>
+            <option value="None">Revoke Deferral (None)</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>MOC / Concession Reference #</label>
+          <input id="bulkDefMoc" placeholder="e.g. MOC-2026-AIMS-084">
+        </div>
+      </div>
+
+      <div class="field-grid">
+        <div class="field">
+          <label>Approver Name & Authority</label>
+          <input id="bulkDefApprover" placeholder="e.g. Technical Authority / Plant Integrity Mgr">
+        </div>
+        <div class="field">
+          <label>Deferral Expiration Date</label>
+          <input id="bulkDefExpiry" type="date">
+        </div>
+      </div>
+
+      <div class="field-grid wide">
+        <div class="field">
+          <label>Technical Justification</label>
+          <textarea id="bulkDefReason" placeholder="Justify why continuous operation is safe (e.g. low corrosion rate, benign fluid, previous inspection history)…"></textarea>
+        </div>
+      </div>
+
+      <div class="field-grid wide">
+        <div class="field">
+          <label>Mitigating & Compensating Actions</label>
+          <textarea id="bulkDefMitigation" placeholder="e.g. Monthly external visual check, online UT spot monitoring, operating pressure de-rate…"></textarea>
+        </div>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeBulkModals()">Cancel</button>
+      <button class="btn primary" id="btnSubmitBulkDeferral">🛡️ Save Bulk Deferral</button>
+    </div>
   </div>
 </div>
 

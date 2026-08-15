@@ -1,21 +1,24 @@
 /**
- * Master Inspection Plan — Client Application Logic
+ * Master Inspection Plan & Asset Integrity Management Suite
  */
 
 const state = {
   view: "dashboard",
   assets: [],
   filteredAssets: [],
+  selectedAssetIds: new Set(),
   page: 1,
   pageSize: 50,
   groupBy: "",
   sheets: [],
+  activeRbiCell: "",
+  activeAgingBucket: "",
   editingAsset: null,
   activeDrawerTab: "specs",
 };
 
 // ---------------------------------------------------------------- Toast Notifications
-function showToast(msg, isError = true) {
+function showToast(msg, isError = false) {
   let container = document.getElementById("toastContainer");
   if (!container) {
     container = document.createElement("div");
@@ -55,6 +58,9 @@ function daysFromToday(iso) {
 }
 
 function statusPill(asset) {
+  if (asset.is_deferred) {
+    return `<span class="status-pill deferred" title="Approved MOC Deferral until ${asset.deferral_expiry || ''}">🛡️ DEFERRED (${fmtDate(asset.deferral_expiry)})</span>`;
+  }
   const nd = asset.next_due;
   if (!nd) return `<span class="status-pill none">No due date</span>`;
   const days = daysFromToday(nd);
@@ -67,7 +73,8 @@ function riskBadge(asset) {
   const r = (asset.risk_category || "LOW").toUpperCase();
   const cls = r === "HIGH" ? "high" : (r === "MEDIUM" ? "medium" : "low");
   const cuiHtml = asset.is_cui ? `<span class="badge-cui" title="Corrosion Under Insulation Susceptible">CUI</span>` : "";
-  return `<span class="badge-risk ${cls}">${r}</span>${cuiHtml}`;
+  const rbiCell = asset.rbi_matrix_cell ? `<span class="badge-rbi-cell" title="RBI 5x5 Matrix Cell">${asset.rbi_matrix_cell}</span>` : "";
+  return `<span class="badge-risk ${cls}">${r}</span>${rbiCell}${cuiHtml}`;
 }
 
 async function api(path, opts) {
@@ -108,7 +115,13 @@ function switchView(view) {
 function assetRowHtml(a, compact) {
   const tag = a.tag || a.sn || "";
   const loc = [a.plant, a.location].filter(Boolean).join(" · ") || "—";
+  const isSelected = state.selectedAssetIds.has(a.id);
+  const checkTd = compact ? "" : `<td style="width:36px; text-align:center;" onclick="event.stopPropagation();">
+    <input type="checkbox" class="row-checkbox" data-id="${a.id}" ${isSelected ? "checked" : ""}>
+  </td>`;
+
   return `<tr data-id="${a.id}">
+    ${checkTd}
     <td>
       <div style="font-weight:600; color:#fff;">${esc(a.name || "(unnamed)")} ${riskBadge(a)}</div>
       <div class="tag-mono">${esc(tag)}</div>
@@ -123,9 +136,10 @@ function tableHtml(rows, compact) {
   if (!rows || !rows.length) {
     return `<table class="assets"><tbody><tr class="empty-row"><td>No records found.</td></tr></tbody></table>`;
   }
+  const checkTh = compact ? "" : `<th style="width:36px; text-align:center;"><input type="checkbox" id="selectAllCheckbox"></th>`;
   const extraHeads = compact ? "" : `<th>Pack # / Header</th><th>Plant & Location</th>`;
   return `<table class="assets">
-    <thead><tr><th>Asset & Risk</th><th>Source Sheet</th><th>Status</th>${extraHeads}</tr></thead>
+    <thead><tr>${checkTh}<th>Asset & Risk</th><th>Source Sheet</th><th>Status</th>${extraHeads}</tr></thead>
     <tbody>${rows.map(a => assetRowHtml(a, compact)).join("")}</tbody>
   </table>`;
 }
@@ -135,13 +149,115 @@ function bindRowClicks(container) {
   container.querySelectorAll("tr[data-id]").forEach(tr => {
     tr.addEventListener("click", () => openAssetDrawer(parseInt(tr.dataset.id)));
   });
+
+  // Checkbox interactions
+  container.querySelectorAll(".row-checkbox").forEach(cb => {
+    cb.addEventListener("change", (e) => {
+      e.stopPropagation();
+      const id = parseInt(cb.dataset.id);
+      if (cb.checked) state.selectedAssetIds.add(id);
+      else state.selectedAssetIds.delete(id);
+      updateBatchActionBar();
+    });
+  });
+
+  const selectAll = container.querySelector("#selectAllCheckbox");
+  if (selectAll) {
+    selectAll.addEventListener("change", (e) => {
+      e.stopPropagation();
+      const rows = state.filteredAssets;
+      if (selectAll.checked) {
+        rows.forEach(r => state.selectedAssetIds.add(r.id));
+      } else {
+        rows.forEach(r => state.selectedAssetIds.delete(r.id));
+      }
+      container.querySelectorAll(".row-checkbox").forEach(cb => cb.checked = selectAll.checked);
+      updateBatchActionBar();
+    });
+  }
 }
 
+// ---------------------------------------------------------------- 5x5 RBI Matrix Heatmap
+const MATRIX_CELL_TIERS = {
+  "5E": "rbi-high", "5D": "rbi-high", "4E": "rbi-high",
+  "5C": "rbi-medhigh", "4D": "rbi-medhigh", "3E": "rbi-medhigh", "5B": "rbi-medhigh",
+  "5A": "rbi-med", "4C": "rbi-med", "3D": "rbi-med", "2E": "rbi-med", "4B": "rbi-med", "3C": "rbi-med", "2D": "rbi-med", "1E": "rbi-med",
+  "4A": "rbi-low", "3B": "rbi-low", "3A": "rbi-low", "2C": "rbi-low", "2B": "rbi-low", "2A": "rbi-low", "1D": "rbi-low", "1C": "rbi-low", "1B": "rbi-low", "1A": "rbi-low"
+};
+
+function render5x5Matrix(matrixCounts) {
+  const container = document.getElementById("rbiMatrixContainer");
+  if (!container) return;
+
+  const pofLabels = ["A (Very Low)", "B (Low)", "C (Moderate)", "D (High)", "E (Very High)"];
+  const pofLetters = ["A", "B", "C", "D", "E"];
+  const cofRows = [
+    {val: 5, lbl: "5 (Catastrophic)"},
+    {val: 4, lbl: "4 (Major)"},
+    {val: 3, lbl: "3 (Moderate)"},
+    {val: 2, lbl: "2 (Minor)"},
+    {val: 1, lbl: "1 (Negligible)"}
+  ];
+
+  let html = `<table class="matrix-table">
+    <thead>
+      <tr>
+        <th class="matrix-axis-label" style="text-align:right;">COF \\ POF</th>
+        ${pofLabels.map((l, idx) => `<th class="matrix-axis-label">${pofLetters[idx]}<br><span style="font-size:9.5px; opacity:0.7;">${l.split(" ")[1]}</span></th>`).join("")}
+      </tr>
+    </thead>
+    <tbody>`;
+
+  cofRows.forEach(crow => {
+    html += `<tr><td class="matrix-axis-label" style="text-align:right; padding-right:8px;">${crow.val}<br><span style="font-size:9.5px; opacity:0.7;">${crow.lbl.split(" ")[1]}</span></td>`;
+    pofLetters.forEach(plet => {
+      const cellKey = `${crow.val}${plet}`;
+      const count = matrixCounts[cellKey] || 0;
+      const tierClass = MATRIX_CELL_TIERS[cellKey] || "rbi-low";
+      const isActive = state.activeRbiCell === cellKey ? "active-filter" : "";
+      
+      html += `<td class="matrix-cell ${tierClass} ${isActive}" onclick="filterByRbiCell('${cellKey}')" title="Filter by Cell ${cellKey} (${count} assets)">
+        <div class="matrix-cell-code">${cellKey}</div>
+        <div class="matrix-cell-count">${count}</div>
+      </td>`;
+    });
+    html += `</tr>`;
+  });
+
+  html += `</tbody></table>`;
+  container.innerHTML = html;
+}
+
+window.filterByRbiCell = function(cellKey) {
+  state.activeRbiCell = cellKey;
+  const btnReset = document.getElementById("btnResetMatrixFilter");
+  if (btnReset) btnReset.style.display = "block";
+  switchView("assets");
+};
+
+window.clearMatrixFilter = function() {
+  state.activeRbiCell = "";
+  const btnReset = document.getElementById("btnResetMatrixFilter");
+  if (btnReset) btnReset.style.display = "none";
+  loadDashboard();
+};
+
+// ---------------------------------------------------------------- Dashboard Loader
 async function loadDashboard() {
   try {
     const d = await api("/api/dashboard");
     
-    // 1. Stat Cards
+    // 1. Executive Compliance Banner
+    const kpiRate = document.getElementById("kpiComplianceRate");
+    if (kpiRate) kpiRate.textContent = `${d.compliance_rate}%`;
+    const kpiUnmanaged = document.getElementById("kpiUnmanagedOverdue");
+    if (kpiUnmanaged) kpiUnmanaged.textContent = d.aging_counts?.unmanaged_overdue ?? d.overdue_count;
+    const kpiApproved = document.getElementById("kpiApprovedDeferrals");
+    if (kpiApproved) kpiApproved.textContent = d.aging_counts?.approved_deferrals ?? 0;
+    const kpiCui = document.getElementById("kpiCuiCount");
+    if (kpiCui) kpiCui.textContent = d.cui_count;
+
+    // 2. Stat Cards
     const statRow = document.getElementById("statRow");
     if (statRow) {
       statRow.innerHTML = `
@@ -168,7 +284,40 @@ async function loadDashboard() {
       `;
     }
 
-    // 2. High Risk List
+    // 3. Overdue Aging Triage Cards
+    const triageGrid = document.getElementById("triageGrid");
+    if (triageGrid && d.aging_counts) {
+      const ac = d.aging_counts;
+      triageGrid.innerHTML = `
+        <div class="triage-card c-0-30" onclick="filterByAging('0_30')">
+          <div class="n">${ac["0_30"]}</div>
+          <div class="lbl">0 – 30 Days Overdue</div>
+        </div>
+        <div class="triage-card c-31-90" onclick="filterByAging('31_90')">
+          <div class="n">${ac["31_90"]}</div>
+          <div class="lbl">31 – 90 Days Overdue</div>
+        </div>
+        <div class="triage-card c-91-180" onclick="filterByAging('91_180')">
+          <div class="n">${ac["91_180"]}</div>
+          <div class="lbl">91 – 180 Days Overdue</div>
+        </div>
+        <div class="triage-card c-180-plus" onclick="filterByAging('180_plus')">
+          <div class="n">${ac["180_plus"]}</div>
+          <div class="lbl">>180 Days (Critical)</div>
+        </div>
+        <div class="triage-card c-deferred" onclick="filterByDeferral('deferred')">
+          <div class="n">${ac["approved_deferrals"]}</div>
+          <div class="lbl">Approved MOC Deferrals</div>
+        </div>
+      `;
+    }
+
+    // 4. Render 5x5 RBI Matrix
+    if (d.rbi_matrix) {
+      render5x5Matrix(d.rbi_matrix);
+    }
+
+    // 5. High Risk List
     const highRiskEl = document.getElementById("highRiskList");
     if (highRiskEl) {
       highRiskEl.innerHTML = tableHtml(d.high_risk || [], true);
@@ -177,7 +326,7 @@ async function loadDashboard() {
       if (countEl) countEl.textContent = (d.high_risk || []).length;
     }
 
-    // 3. Overdue List
+    // 6. Overdue List
     const overdueEl = document.getElementById("overdueList");
     if (overdueEl) {
       overdueEl.innerHTML = tableHtml(d.overdue || [], true);
@@ -186,7 +335,7 @@ async function loadDashboard() {
       if (countEl) countEl.textContent = (d.overdue || []).length;
     }
 
-    // 4. Temporary Repairs Widget List
+    // 7. Temporary Repairs Widget
     const tempRepairsWidgetEl = document.getElementById("tempRepairsWidgetList");
     if (tempRepairsWidgetEl) {
       const repairs = d.expired_repairs || [];
@@ -207,28 +356,7 @@ async function loadDashboard() {
       }
     }
 
-    // 5. Critical Scope Widget List
-    const criticalWidgetEl = document.getElementById("criticalWidgetList");
-    if (criticalWidgetEl) {
-      const crit = d.pending_critical || [];
-      const countEl = document.getElementById("criticalCountBadge");
-      if (countEl) countEl.textContent = crit.length;
-      if (!crit.length) {
-        criticalWidgetEl.innerHTML = `<table class="assets"><tbody><tr class="empty-row"><td>No pending critical turnaround replacements.</td></tr></tbody></table>`;
-      } else {
-        criticalWidgetEl.innerHTML = `<table class="assets">
-          <thead><tr><th>Pack # & Item</th><th>Category Section</th><th>Replacement Scope</th><th>Status</th></tr></thead>
-          <tbody>${crit.map(c => `<tr>
-            <td><div style="font-weight:600; color:#fff;">${esc(c.item_description || c.pack_no || "")}</div><div class="tag-mono">${esc(c.pack_no || "")}</div></td>
-            <td><span class="tag-mono">${esc(c.category_section || "")}</span></td>
-            <td><div style="max-width:240px; font-size:12px; color:var(--text-muted);">${esc(c.replacement_scope || "")}</div></td>
-            <td><span class="status-pill soon">Pending</span></td>
-          </tr>`).join("")}</tbody>
-        </table>`;
-      }
-    }
-
-    // 6. Source Sheet Chips
+    // 8. Source Sheet Chips
     const bySheetEl = document.getElementById("bySheet");
     if (bySheetEl && d.sheets && d.by_sheet) {
       state.sheets = d.sheets;
@@ -239,7 +367,6 @@ async function loadDashboard() {
         </span>`;
       }).join("");
 
-      // Update sheet select options
       const sel = document.getElementById("sheetFilter");
       if (sel) {
         const current = sel.value;
@@ -250,13 +377,26 @@ async function loadDashboard() {
     }
 
   } catch (err) {
-    showToast("Failed to load dashboard: " + err.message);
+    showToast("Failed to load dashboard: " + err.message, true);
   }
 }
 
 window.filterBySheet = function(sheetName) {
   const sel = document.getElementById("sheetFilter");
   if (sel) sel.value = sheetName;
+  switchView("assets");
+};
+
+window.filterByAging = function(bucket) {
+  state.activeAgingBucket = bucket;
+  const af = document.getElementById("agingFilter");
+  if (af) af.value = bucket;
+  switchView("assets");
+};
+
+window.filterByDeferral = function(status) {
+  const df = document.getElementById("deferralFilter");
+  if (df) df.value = status;
   switchView("assets");
 };
 
@@ -287,6 +427,8 @@ if (btnClearSearch) {
 
 document.getElementById("sheetFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
 document.getElementById("riskFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
+document.getElementById("agingFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
+document.getElementById("deferralFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
 document.getElementById("groupFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
 document.getElementById("overdueOnly")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
 
@@ -295,8 +437,11 @@ document.getElementById("btnResetFilters")?.addEventListener("click", () => {
   if (btnClearSearch) btnClearSearch.style.display = "none";
   const sf = document.getElementById("sheetFilter"); if (sf) sf.value = "";
   const rf = document.getElementById("riskFilter"); if (rf) rf.value = "";
+  const af = document.getElementById("agingFilter"); if (af) af.value = "";
+  const df = document.getElementById("deferralFilter"); if (df) df.value = "";
   const gf = document.getElementById("groupFilter"); if (gf) gf.value = "";
   const oo = document.getElementById("overdueOnly"); if (oo) oo.checked = false;
+  state.activeRbiCell = "";
   state.page = 1;
   loadAssets();
 });
@@ -328,17 +473,24 @@ async function loadAssets() {
     const q = searchBox ? searchBox.value.trim() : "";
     const sheet = document.getElementById("sheetFilter")?.value || "";
     const risk = document.getElementById("riskFilter")?.value || "";
+    const aging = document.getElementById("agingFilter")?.value || "";
+    const deferral = document.getElementById("deferralFilter")?.value || "";
     const overdue = document.getElementById("overdueOnly")?.checked ? "1" : "0";
     state.groupBy = document.getElementById("groupFilter")?.value || "";
 
-    const params = new URLSearchParams({q, sheet, risk, overdue});
+    const params = new URLSearchParams({
+      q, sheet, risk, overdue,
+      aging, deferral,
+      rbi_cell: state.activeRbiCell
+    });
+
     const rows = await api("/api/assets?" + params.toString());
     state.assets = rows;
     state.filteredAssets = rows;
 
     renderAssetsTable();
   } catch (err) {
-    showToast("Failed to load assets: " + err.message);
+    showToast("Failed to load assets: " + err.message, true);
   }
 }
 
@@ -385,7 +537,6 @@ function renderAssetsTable() {
     return;
   }
 
-  // Handle grouping if selected
   if (state.groupBy) {
     const groups = {};
     pageRows.forEach(a => {
@@ -395,11 +546,11 @@ function renderAssetsTable() {
     });
 
     let html = `<table class="assets">
-      <thead><tr><th>Asset & Risk</th><th>Source Sheet</th><th>Status</th><th>Pack # / Header</th><th>Plant & Location</th></tr></thead>
+      <thead><tr><th style="width:36px; text-align:center;"><input type="checkbox" id="selectAllCheckbox"></th><th>Asset & Risk</th><th>Source Sheet</th><th>Status</th><th>Pack # / Header</th><th>Plant & Location</th></tr></thead>
       <tbody>`;
 
     for (const [groupName, groupAssets] of Object.entries(groups)) {
-      html += `<tr class="group-header-row"><td colspan="5">📂 ${esc(groupName)} (${groupAssets.length} assets)</td></tr>`;
+      html += `<tr class="group-header-row"><td colspan="6">📂 ${esc(groupName)} (${groupAssets.length} assets)</td></tr>`;
       html += groupAssets.map(a => assetRowHtml(a, false)).join("");
     }
     html += `</tbody></table>`;
@@ -409,6 +560,483 @@ function renderAssetsTable() {
   }
 
   bindRowClicks(wrapEl);
+}
+
+// ---------------------------------------------------------------- Batch Action Bar & Modals
+function updateBatchActionBar() {
+  const bar = document.getElementById("batchActionBar");
+  const badge = document.getElementById("selectedCountBadge");
+  const count = state.selectedAssetIds.size;
+  if (badge) badge.textContent = count;
+  if (bar) bar.classList.toggle("open", count > 0);
+}
+
+document.getElementById("btnClearSelection")?.addEventListener("click", () => {
+  state.selectedAssetIds.clear();
+  document.querySelectorAll(".row-checkbox, #selectAllCheckbox").forEach(cb => cb.checked = false);
+  updateBatchActionBar();
+});
+
+document.getElementById("btnExportSelected")?.addEventListener("click", () => {
+  if (!state.selectedAssetIds.size) return;
+  const selectedRows = state.assets.filter(a => state.selectedAssetIds.has(a.id));
+  const csv = convertToCSV(selectedRows);
+  downloadCSV(csv, `selected_assets_${selectedRows.length}.csv`);
+});
+
+function convertToCSV(arr) {
+  if (!arr.length) return "";
+  const keys = Object.keys(arr[0]).filter(k => k !== "extra");
+  let out = keys.join(",") + "\n";
+  arr.forEach(row => {
+    out += keys.map(k => `"${String(row[k] ?? "").replace(/"/g, '""')}"`).join(",") + "\n";
+  });
+  return out;
+}
+
+function downloadCSV(csvText, filename) {
+  const blob = new Blob([csvText], {type: "text/csv;charset=utf-8;"});
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.setAttribute("download", filename);
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+// Bulk Modals
+document.getElementById("btnOpenBulkLog")?.addEventListener("click", () => {
+  const count = state.selectedAssetIds.size;
+  if (!count) return;
+  document.getElementById("bulkLogCountText").textContent = count;
+  document.getElementById("bulkLogDate").value = new Date().toISOString().split("T")[0];
+  document.getElementById("bulkLogModal").classList.add("open");
+});
+
+document.getElementById("btnOpenBulkDeferral")?.addEventListener("click", () => {
+  const count = state.selectedAssetIds.size;
+  if (!count) return;
+  document.getElementById("bulkDeferralCountText").textContent = count;
+  document.getElementById("bulkDeferralModal").classList.add("open");
+});
+
+window.closeBulkModals = function() {
+  document.querySelectorAll(".modal-overlay").forEach(m => m.classList.remove("open"));
+};
+
+document.getElementById("btnSubmitBulkLog")?.addEventListener("click", async () => {
+  const assetIds = Array.from(state.selectedAssetIds);
+  const payload = {
+    asset_ids: assetIds,
+    insp_date: document.getElementById("bulkLogDate")?.value || null,
+    insp_type: document.getElementById("bulkLogType")?.value || "OSI",
+    inspector_name: document.getElementById("bulkLogInspector")?.value?.trim() || null,
+    insp_method: document.getElementById("bulkLogMethod")?.value?.trim() || null,
+    findings: document.getElementById("bulkLogFindings")?.value?.trim() || null,
+    next_due_date: document.getElementById("bulkLogNextDue")?.value || null,
+  };
+
+  try {
+    const res = await api("/api/assets/bulk-log", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+    showToast(res.message || "Bulk inspection applied successfully!", false);
+    closeBulkModals();
+    state.selectedAssetIds.clear();
+    updateBatchActionBar();
+    refreshCurrentView();
+  } catch (err) {
+    showToast("Bulk log failed: " + err.message, true);
+  }
+});
+
+document.getElementById("btnSubmitBulkDeferral")?.addEventListener("click", async () => {
+  const assetIds = Array.from(state.selectedAssetIds);
+  const payload = {
+    asset_ids: assetIds,
+    deferral_status: document.getElementById("bulkDefStatus")?.value || "Approved",
+    deferral_moc_no: document.getElementById("bulkDefMoc")?.value?.trim() || null,
+    deferral_approver: document.getElementById("bulkDefApprover")?.value?.trim() || null,
+    deferral_expiry: document.getElementById("bulkDefExpiry")?.value || null,
+    deferral_reason: document.getElementById("bulkDefReason")?.value?.trim() || null,
+    deferral_mitigation: document.getElementById("bulkDefMitigation")?.value?.trim() || null,
+  };
+
+  try {
+    const res = await api("/api/assets/bulk-deferral", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload)
+    });
+    showToast(res.message || "Bulk deferral applied successfully!", false);
+    closeBulkModals();
+    state.selectedAssetIds.clear();
+    updateBatchActionBar();
+    refreshCurrentView();
+  } catch (err) {
+    showToast("Bulk deferral failed: " + err.message, true);
+  }
+});
+
+// ---------------------------------------------------------------- Slide-Over Asset Drawer & Calculator
+const overlay = document.getElementById("drawerOverlay");
+document.getElementById("drawerClose")?.addEventListener("click", closeDrawer);
+overlay?.addEventListener("click", e => { if (e.target === overlay) closeDrawer(); });
+
+function closeDrawer() {
+  if (overlay) overlay.classList.remove("open");
+  state.editingAsset = null;
+}
+
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape") {
+    closeDrawer();
+    closeBulkModals();
+  }
+});
+
+const CORE_FIELDS = [
+  ["name", "Asset Name"], ["field", "Pack # / Header Section"], ["location", "Location / Area"],
+  ["tag", "Equipment Tag #"], ["asset_number", "Asset ID Number"], ["plant", "Plant / Facility"],
+  ["unit_name", "Unit Name"], ["source_sheet", "Source Sheet"], ["in_service", "In Service Status"],
+  ["insulation", "Insulation (CUI Factor)"],
+];
+
+const ENVELOPE_FIELDS = [
+  ["fluid_service", "Fluid Service"], ["material_spec", "Material Specification"],
+  ["design_pressure", "Design Pressure (psi/bar)"], ["operating_pressure", "Operating Pressure"],
+  ["design_temp", "Design Temp (°C)"], ["operating_temp", "Operating Temp (°C)"],
+  ["nominal_thickness", "Nominal Thickness (mm)"], ["t_min", "Min Required t_min (mm)"],
+];
+
+const DATE_FIELDS = [
+  ["date_osi_last", "Last OSI Inspection Date"], ["date_osi_next", "Next OSI Due Date"],
+  ["date_internal_last", "Last Internal Inspection Date"], ["date_internal_next", "Next Internal Due Date"],
+];
+
+function fieldInput(key, label, value, type) {
+  const val = esc(value ?? "");
+  const inputType = type || "text";
+  return `<div class="field">
+    <label>${label}</label>
+    <input data-field="${key}" type="${inputType}" value="${val}">
+  </div>`;
+}
+
+async function openAssetDrawer(id) {
+  try {
+    const a = await api("/api/assets/" + id);
+    state.editingAsset = a;
+    
+    const titleEl = document.getElementById("drawerTitle");
+    if (titleEl) titleEl.innerHTML = `${esc(a.name || "Asset")} ${riskBadge(a)}`;
+
+    const subEl = document.getElementById("drawerSubtitle");
+    if (subEl) subEl.textContent = `ID #${a.id} · Tag: ${a.tag || a.sn || "—"} · Sheet: ${a.source_sheet || "—"}`;
+
+    const extraRows = Object.entries(a.extra || {}).filter(([k]) => !k.endsWith("(raw)"));
+
+    const bodyEl = document.getElementById("drawerBody");
+    if (!bodyEl) return;
+
+    bodyEl.innerHTML = `
+      <div class="drawer-tabs">
+        <button class="drawer-tab active" id="tabbtn-specs" onclick="switchDrawerTab('specs')">📋 Specs & Envelope</button>
+        <button class="drawer-tab" id="tabbtn-risk" onclick="switchDrawerTab('risk')">🛡️ Risk & Deferrals</button>
+        <button class="drawer-tab" id="tabbtn-logs" onclick="switchDrawerTab('logs')">🔍 NDT & Calculator (${(a.log || []).length})</button>
+      </div>
+
+      <!-- TAB 1: SPECS -->
+      <div id="dtab-specs" class="dtab-content">
+        <div class="section-title">Identification & Location</div>
+        <div class="field-grid">
+          ${CORE_FIELDS.map(([k,l]) => fieldInput(k,l,a[k])).join("")}
+        </div>
+
+        <div class="section-title">Design & Operating Envelope</div>
+        <div class="field-grid">
+          ${ENVELOPE_FIELDS.map(([k,l]) => fieldInput(k,l,a[k])).join("")}
+        </div>
+      </div>
+
+      <!-- TAB 2: RISK & DEFERRALS -->
+      <div id="dtab-risk" class="dtab-content" style="display:none;">
+        <div class="section-title">API 580 RBI Risk & Damage Mechanisms</div>
+        <div class="field-grid">
+          <div class="field"><label>RBI Risk Level</label><select data-field="risk_category">
+            <option value="HIGH" ${a.risk_category==="HIGH"?"selected":""}>HIGH (Priority Tier 1)</option>
+            <option value="MEDIUM" ${a.risk_category==="MEDIUM"?"selected":""}>MEDIUM (Tier 2)</option>
+            <option value="LOW" ${a.risk_category==="LOW"?"selected":""}>LOW (Tier 3)</option>
+          </select></div>
+          <div class="field"><label>RBI Matrix 5x5 Cell</label><input value="${esc(a.rbi_matrix_cell || '')}" readonly></div>
+        </div>
+
+        <div class="field-grid">
+          <div class="field"><label>Corrosion Rate (mm/yr)</label><input data-field="corrosion_rate" value="${esc(a.corrosion_rate || '')}"></div>
+          <div class="field"><label>Estimated Remaining Life (yrs)</label><input data-field="remaining_life" value="${esc(a.remaining_life || '')}"></div>
+        </div>
+
+        <div class="section-title">Scheduled Inspection Due Dates</div>
+        <div class="field-grid">
+          ${DATE_FIELDS.map(([k,l]) => fieldInput(k,l,a[k],"text")).join("")}
+        </div>
+
+        <!-- Formal Deferral Governance Form -->
+        <div class="section-title">🛡️ Formal Inspection Deferral & MOC Concession</div>
+        <div class="field-grid">
+          <div class="field"><label>Deferral Status</label><select data-field="deferral_status">
+            <option value="None" ${a.deferral_status==="None"||!a.deferral_status?"selected":""}>None (No Active Deferral)</option>
+            <option value="Approved" ${a.deferral_status==="Approved"?"selected":""}>Approved (Valid MOC Concession)</option>
+            <option value="Under Review" ${a.deferral_status==="Under Review"?"selected":""}>Under Review (MOC In-Progress)</option>
+            <option value="Expired" ${a.deferral_status==="Expired"?"selected":""}>Expired Concession</option>
+          </select></div>
+          <div class="field"><label>MOC / Concession Reference #</label><input data-field="deferral_moc_no" value="${esc(a.deferral_moc_no || '')}"></div>
+        </div>
+
+        <div class="field-grid">
+          <div class="field"><label>Approver Name & Authority</label><input data-field="deferral_approver" value="${esc(a.deferral_approver || '')}"></div>
+          <div class="field"><label>Deferral Expiration Date</label><input data-field="deferral_expiry" type="date" value="${esc(a.deferral_expiry || '')}"></div>
+        </div>
+
+        <div class="field-grid wide">
+          <div class="field"><label>Technical Justification</label><textarea data-field="deferral_reason">${esc(a.deferral_reason || '')}</textarea></div>
+          <div class="field"><label>Compensating Mitigating Measures</label><textarea data-field="deferral_mitigation">${esc(a.deferral_mitigation || '')}</textarea></div>
+          <div class="field"><label>General Integrity Remarks</label><textarea data-field="remarks">${esc(a.remarks || '')}</textarea></div>
+        </div>
+
+        ${extraRows.length ? `
+          <div class="section-title">Original Sheet Column Metadata</div>
+          <div class="field-grid wide">
+            ${extraRows.map(([k,v]) => `<div class="field"><label>${esc(k)}</label>
+              <input value="${esc(v)}" readonly></div>`).join("")}
+          </div>` : ""}
+      </div>
+
+      <!-- TAB 3: LOGS & CALCULATOR -->
+      <div id="dtab-logs" class="dtab-content" style="display:none;">
+        
+        <!-- API 510/570 Auto-Calculator Widget -->
+        <div class="calc-card">
+          <div style="font-weight:700; color:#fff; font-size:13px; display:flex; justify-content:space-between;">
+            <span>⚡ API 510/570 Remaining Life & Next Due Calculator</span>
+          </div>
+          <div class="field-grid" style="margin-top:10px;">
+            <div class="field"><label>Nominal/Prev Thickness (mm)</label><input id="calcTPrev" value="${esc(a.nominal_thickness || '8.0')}"></div>
+            <div class="field"><label>Actual Measured t_act (mm)</label><input id="calcTAct" placeholder="e.g. 6.8"></div>
+          </div>
+          <div class="field-grid">
+            <div class="field"><label>Min Required t_min (mm)</label><input id="calcTMin" value="${esc(a.t_min || '3.5')}"></div>
+            <div class="field"><label>Years Between Inspections</label><input id="calcYears" value="5.0"></div>
+          </div>
+          <div style="margin-top:8px;">
+            <button class="btn ghost small" onclick="computeRemainingLife()">Calculate RL & Next Due</button>
+            <button class="btn primary small" id="btnApplyCalc" style="display:none;" onclick="applyCalcToForm()">Apply to Form</button>
+          </div>
+          <div class="calc-results-grid" id="calcResultsGrid" style="display:none;">
+            <div class="calc-res-item"><div class="calc-res-val" id="resCR">0.000</div><div class="calc-res-lbl">CR (mm/yr)</div></div>
+            <div class="calc-res-item"><div class="calc-res-val" id="resRL">0.0</div><div class="calc-res-lbl">Remaining Life (yrs)</div></div>
+            <div class="calc-res-item"><div class="calc-res-val" id="resInterval">0.0</div><div class="calc-res-lbl">Half-Life Int (yrs)</div></div>
+            <div class="calc-res-item"><div class="calc-res-val" id="resDue" style="font-size:13px;">—</div><div class="calc-res-lbl">Suggested Due Date</div></div>
+          </div>
+        </div>
+
+        <div class="section-title">Record New Inspection Activity</div>
+        <div class="field-grid">
+          <div class="field"><label>Inspection Date</label><input id="logDate" type="date" value="${new Date().toISOString().split('T')[0]}"></div>
+          <div class="field"><label>Inspection Type</label>
+            <select id="logType">
+              <option value="OSI">OSI (On-Stream Inspection)</option>
+              <option value="Internal">Internal Inspection</option>
+              <option value="OSI-ADV">OSI Advanced NDT (PAUT/TOFD)</option>
+              <option value="NDT UT Thickness">NDT UT Wall Thickness</option>
+              <option value="Visual / CUI">Visual / CUI Surveillance</option>
+            </select>
+          </div>
+        </div>
+        <div class="field-grid">
+          <div class="field"><label>Inspector Name & Cert #</label><input id="logInspector" placeholder="e.g. M. Ahmed (API 570 #4421)"></div>
+          <div class="field"><label>NDT Technique</label><input id="logMethod" placeholder="e.g. Digital UT, MPT"></div>
+        </div>
+        <div class="field-grid">
+          <div class="field"><label>Actual Measured Min Thickness t_act (mm)</label><input id="logTActual" placeholder="e.g. 6.8 mm"></div>
+          <div class="field"><label>Corrective Action Required?</label><input id="logAction" placeholder="e.g. None / Turnaround Scope"></div>
+        </div>
+        <div class="field-grid wide">
+          <div class="field"><label>Findings & Observations</label><textarea id="logFindings" placeholder="Document wall thinning, corrosion patterns, coating condition, recommendations…"></textarea></div>
+        </div>
+        <div class="field-grid">
+          <div class="field"><label>Next Scheduled Due Date (YYYY-MM-DD)</label><input id="logNextDue" type="date"></div>
+        </div>
+        <div class="drawer-actions" style="margin-top:12px; margin-bottom:24px;">
+          <button id="btnAddLog" class="btn primary">💾 Save Inspection Record</button>
+        </div>
+
+        ${a.log && a.log.length ? `
+          <div class="section-title">Historical Inspection & NDT Log</div>
+          ${a.log.map(l => `<div class="log-entry">
+            <div class="meta">${esc(l.insp_date || "Date N/A")} · ${esc(l.insp_type || "Inspection")}${l.insp_method ? " · " + esc(l.insp_method) : ""}${l.next_due_date ? " · Next Due: " + esc(l.next_due_date) : ""}</div>
+            ${l.inspector_name ? `<div style="font-weight:600; font-size:12px; color:var(--accent);">Inspector: ${esc(l.inspector_name)}</div>` : ""}
+            ${l.t_actual ? `<div style="font-size:12px; color:var(--text-muted);">Measured Wall Thickness: <b>${esc(l.t_actual)}</b></div>` : ""}
+            ${l.action_required ? `<div style="font-size:12px; color:var(--amber);">Action: ${esc(l.action_required)}</div>` : ""}
+            <div style="margin-top:6px; color:#fff; font-size:12.5px;">${esc(l.findings || "")}</div>
+            <button class="btn danger small" style="position:absolute; top:10px; right:10px;" onclick="deleteLog(${a.id}, ${l.id})">Delete</button>
+          </div>`).join("")}
+        ` : `<div style="color:var(--text-faint); font-size:12.5px; margin-top:8px;">No historical inspection logs recorded yet.</div>`}
+      </div>
+
+      <div class="drawer-actions" style="margin-top:24px; border-top:1px solid var(--border); padding-top:16px;">
+        <button id="btnSaveAsset" class="btn primary">💾 Save Changes</button>
+        <button id="btnArchiveAsset" class="btn danger">${a.archived ? "♻️ Restore Asset" : "📦 Archive Asset"}</button>
+      </div>
+    `;
+
+    document.getElementById("btnSaveAsset")?.addEventListener("click", () => saveAsset(id));
+    document.getElementById("btnArchiveAsset")?.addEventListener("click", () => toggleArchive(id, !a.archived));
+    document.getElementById("btnAddLog")?.addEventListener("click", () => addLog(id));
+
+    if (overlay) overlay.classList.add("open");
+  } catch (err) {
+    showToast("Failed to open asset details: " + err.message, true);
+  }
+}
+
+// ---------------------------------------------------------------- Calculator Functions
+let lastCalcResult = null;
+
+window.computeRemainingLife = async function() {
+  const t_prev = parseFloat(document.getElementById("calcTPrev")?.value || 0);
+  const t_act = parseFloat(document.getElementById("calcTAct")?.value || 0);
+  const t_min = parseFloat(document.getElementById("calcTMin")?.value || 0);
+  const years = parseFloat(document.getElementById("calcYears")?.value || 1);
+
+  if (!t_act || t_act <= 0) {
+    showToast("Please enter a valid actual measured thickness (t_act).", true);
+    return;
+  }
+
+  try {
+    const res = await api("/api/calc/remaining-life", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({t_prev, t_act, t_min, years_between: years})
+    });
+
+    if (!res.success) throw new Error(res.error || "Calculation failed");
+    lastCalcResult = res;
+
+    document.getElementById("resCR").textContent = `${res.corrosion_rate_mm_yr}`;
+    document.getElementById("resRL").textContent = `${res.remaining_life_years}`;
+    document.getElementById("resInterval").textContent = `${res.half_life_interval_years}`;
+    document.getElementById("resDue").textContent = res.suggested_next_due_date || "—";
+
+    document.getElementById("calcResultsGrid").style.display = "grid";
+    document.getElementById("btnApplyCalc").style.display = "inline-flex";
+  } catch (err) {
+    showToast("Calculation error: " + err.message, true);
+  }
+};
+
+window.applyCalcToForm = function() {
+  if (!lastCalcResult) return;
+  const logT = document.getElementById("logTActual");
+  const logDue = document.getElementById("logNextDue");
+  if (logT) logT.value = `${lastCalcResult.t_act} mm`;
+  if (logDue && lastCalcResult.suggested_next_due_date) logDue.value = lastCalcResult.suggested_next_due_date;
+  showToast("Calculated thickness and next due date applied to form!", false);
+};
+
+window.switchDrawerTab = function(tabName) {
+  document.querySelectorAll(".drawer-tab").forEach(t => t.classList.remove("active"));
+  document.querySelectorAll(".dtab-content").forEach(c => c.style.display = "none");
+  
+  const btn = document.getElementById("tabbtn-" + tabName);
+  if (btn) btn.classList.add("active");
+  const tabContent = document.getElementById("dtab-" + tabName);
+  if (tabContent) tabContent.style.display = "block";
+};
+
+async function saveAsset(id) {
+  const inputs = document.querySelectorAll("#drawerBody [data-field]");
+  const payload = {};
+  inputs.forEach(el => { payload[el.dataset.field] = el.value || null; });
+  try {
+    await api("/api/assets/" + id, {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    closeDrawer();
+    refreshCurrentView();
+    showToast("Asset changes saved successfully!", false);
+  } catch (err) {
+    showToast("Save failed: " + err.message, true);
+  }
+}
+
+async function toggleArchive(id, archived) {
+  try {
+    await api("/api/assets/" + id, {
+      method: "PUT",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({archived: archived ? 1 : 0}),
+    });
+    closeDrawer();
+    refreshCurrentView();
+    showToast(`Asset ${archived ? "archived" : "restored"}`, false);
+  } catch (err) {
+    showToast("Archive toggle failed: " + err.message, true);
+  }
+}
+
+async function addLog(id) {
+  const dateVal = document.getElementById("logDate")?.value;
+  const nextDueVal = document.getElementById("logNextDue")?.value;
+
+  const payload = {
+    insp_date: dateVal ? dateVal.trim() : null,
+    insp_type: document.getElementById("logType")?.value || "OSI",
+    inspector_name: document.getElementById("logInspector")?.value?.trim() || null,
+    insp_method: document.getElementById("logMethod")?.value?.trim() || null,
+    t_actual: document.getElementById("logTActual")?.value?.trim() || null,
+    action_required: document.getElementById("logAction")?.value?.trim() || null,
+    findings: document.getElementById("logFindings")?.value?.trim() || null,
+    next_due_date: nextDueVal ? nextDueVal.trim() : null,
+  };
+
+  try {
+    await api("/api/assets/" + id + "/log", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(payload),
+    });
+    showToast("Inspection record added successfully!", false);
+    openAssetDrawer(id);
+    refreshCurrentView();
+  } catch (err) {
+    showToast("Failed to add inspection log: " + err.message, true);
+  }
+}
+
+window.deleteLog = async function(assetId, logId) {
+  if (!confirm("Are you sure you want to delete this inspection record?")) return;
+  try {
+    await api("/api/logs/" + logId, { method: "DELETE" });
+    showToast("Inspection record removed", false);
+    openAssetDrawer(assetId);
+    refreshCurrentView();
+  } catch (err) {
+    showToast("Failed to delete log: " + err.message, true);
+  }
+};
+
+function refreshCurrentView() {
+  if (state.view === "dashboard") loadDashboard();
+  if (state.view === "assets") loadAssets();
+  if (state.view === "critical") loadCriticalAssets();
+  if (state.view === "temprepairs") loadTempRepairs();
+  if (state.view === "yearly") loadYearlyPlan();
 }
 
 // ---------------------------------------------------------------- Critical Turnaround Replacements
@@ -462,7 +1090,7 @@ async function loadCriticalAssets() {
       </tr>`).join("")}</tbody>
     </table>`;
   } catch (err) {
-    showToast("Failed to load critical turnaround assets: " + err.message);
+    showToast("Failed to load critical turnaround assets: " + err.message, true);
   }
 }
 
@@ -477,7 +1105,7 @@ window.toggleCriticalDone = async function(event, id, doneStatus) {
     loadCriticalAssets();
     showToast(`Turnaround scope status updated to: ${doneStatus === "Yes" ? "Completed" : "Pending"}`, false);
   } catch (err) {
-    showToast("Failed to update status: " + err.message);
+    showToast("Failed to update status: " + err.message, true);
   }
 };
 
@@ -537,7 +1165,7 @@ async function loadTempRepairs() {
       }).join("")}</tbody>
     </table>`;
   } catch (err) {
-    showToast("Failed to load temporary repairs: " + err.message);
+    showToast("Failed to load temporary repairs: " + err.message, true);
   }
 }
 
@@ -562,7 +1190,7 @@ async function loadYearlyPlan() {
       bindRowClicks(el);
     }
   } catch (err) {
-    showToast("Failed to load yearly plan: " + err.message);
+    showToast("Failed to load yearly plan: " + err.message, true);
   }
 }
 
@@ -606,291 +1234,24 @@ if (btnReimport && picker) {
           showToast(res.message || "Re-import successful!", false);
           refreshCurrentView();
         } catch (err) {
-          showToast("Re-import failed: " + err.message);
+          showToast("Re-import failed: " + err.message, true);
         } finally {
           btnReimport.disabled = false;
           btnReimport.innerHTML = origText;
         }
       };
       reader.onerror = () => {
-        showToast("Failed to read selected file.");
+        showToast("Failed to read selected file.", true);
         btnReimport.disabled = false;
         btnReimport.innerHTML = origText;
       };
       reader.readAsDataURL(file);
     } catch (err) {
-      showToast("Error preparing file upload: " + err.message);
+      showToast("Error preparing file upload: " + err.message, true);
       btnReimport.disabled = false;
       btnReimport.innerHTML = origText;
     }
   });
-}
-
-// ---------------------------------------------------------------- Slide-Over Asset Drawer
-const overlay = document.getElementById("drawerOverlay");
-document.getElementById("drawerClose")?.addEventListener("click", closeDrawer);
-overlay?.addEventListener("click", e => { if (e.target === overlay) closeDrawer(); });
-
-function closeDrawer() {
-  if (overlay) overlay.classList.remove("open");
-  state.editingAsset = null;
-}
-
-document.addEventListener("keydown", e => {
-  if (e.key === "Escape") closeDrawer();
-});
-
-const CORE_FIELDS = [
-  ["name", "Asset Name"], ["field", "Pack # / Header Section"], ["location", "Location / Area"],
-  ["tag", "Equipment Tag #"], ["asset_number", "Asset ID Number"], ["plant", "Plant / Facility"],
-  ["unit_name", "Unit Name"], ["source_sheet", "Source Sheet"], ["in_service", "In Service Status"],
-  ["insulation", "Insulation (CUI Factor)"],
-];
-
-const ENVELOPE_FIELDS = [
-  ["fluid_service", "Fluid Service"], ["material_spec", "Material Specification"],
-  ["design_pressure", "Design Pressure (psi/bar)"], ["operating_pressure", "Operating Pressure"],
-  ["design_temp", "Design Temp (°C)"], ["operating_temp", "Operating Temp (°C)"],
-  ["nominal_thickness", "Nominal Thickness (mm)"], ["t_min", "Min Required t_min (mm)"],
-];
-
-const RISK_FIELDS = [
-  ["risk_category", "Risk Level (HIGH / MEDIUM / LOW)"],
-  ["damage_mechanisms", "Damage Mechanisms (e.g. CUI, Internal Thinning)"],
-  ["corrosion_rate", "Corrosion Rate (mm/yr)"],
-  ["remaining_life", "Estimated Remaining Life (years)"],
-];
-
-const DATE_FIELDS = [
-  ["date_osi_last", "Last OSI Inspection Date"], ["date_osi_next", "Next OSI Due Date"],
-  ["date_internal_last", "Last Internal Inspection Date"], ["date_internal_next", "Next Internal Due Date"],
-];
-
-function fieldInput(key, label, value, type) {
-  const val = esc(value ?? "");
-  const inputType = type || "text";
-  return `<div class="field">
-    <label>${label}</label>
-    <input data-field="${key}" type="${inputType}" value="${val}">
-  </div>`;
-}
-
-async function openAssetDrawer(id) {
-  try {
-    const a = await api("/api/assets/" + id);
-    state.editingAsset = a;
-    
-    const titleEl = document.getElementById("drawerTitle");
-    if (titleEl) titleEl.innerHTML = `${esc(a.name || "Asset")} ${riskBadge(a)}`;
-
-    const subEl = document.getElementById("drawerSubtitle");
-    if (subEl) subEl.textContent = `ID #${a.id} · Tag: ${a.tag || a.sn || "—"} · Sheet: ${a.source_sheet || "—"}`;
-
-    const extraRows = Object.entries(a.extra || {}).filter(([k]) => !k.endsWith("(raw)"));
-
-    const bodyEl = document.getElementById("drawerBody");
-    if (!bodyEl) return;
-
-    bodyEl.innerHTML = `
-      <div class="drawer-tabs">
-        <button class="drawer-tab active" id="tabbtn-specs" onclick="switchDrawerTab('specs')">📋 Specs & Envelope</button>
-        <button class="drawer-tab" id="tabbtn-risk" onclick="switchDrawerTab('risk')">🛡️ Risk & Condition</button>
-        <button class="drawer-tab" id="tabbtn-logs" onclick="switchDrawerTab('logs')">🔍 NDT & Inspection Logs (${(a.log || []).length})</button>
-      </div>
-
-      <!-- TAB 1: SPECS -->
-      <div id="dtab-specs" class="dtab-content">
-        <div class="section-title">Identification & Location</div>
-        <div class="field-grid">
-          ${CORE_FIELDS.map(([k,l]) => fieldInput(k,l,a[k])).join("")}
-        </div>
-
-        <div class="section-title">Design & Operating Envelope</div>
-        <div class="field-grid">
-          ${ENVELOPE_FIELDS.map(([k,l]) => fieldInput(k,l,a[k])).join("")}
-        </div>
-      </div>
-
-      <!-- TAB 2: RISK & CONDITION -->
-      <div id="dtab-risk" class="dtab-content" style="display:none;">
-        <div class="section-title">Risk & Damage Mechanisms</div>
-        <div class="field-grid">
-          ${RISK_FIELDS.map(([k,l]) => fieldInput(k,l,a[k])).join("")}
-        </div>
-
-        <div class="section-title">Scheduled Inspection Due Dates</div>
-        <div class="field-grid">
-          ${DATE_FIELDS.map(([k,l]) => fieldInput(k,l,a[k],"text")).join("")}
-        </div>
-
-        <div class="field-grid wide">
-          <div class="field">
-            <label>Remarks & Integrity Recommendations</label>
-            <textarea data-field="remarks">${esc(a.remarks)}</textarea>
-          </div>
-        </div>
-
-        ${extraRows.length ? `
-          <div class="section-title">Original Sheet Column Metadata</div>
-          <div class="field-grid wide">
-            ${extraRows.map(([k,v]) => `<div class="field"><label>${esc(k)}</label>
-              <input value="${esc(v)}" readonly></div>`).join("")}
-          </div>` : ""}
-      </div>
-
-      <!-- TAB 3: LOGS & NDT -->
-      <div id="dtab-logs" class="dtab-content" style="display:none;">
-        <div class="section-title">Record New NDT / Inspection Activity</div>
-        <div class="field-grid">
-          <div class="field"><label>Inspection Date (YYYY-MM-DD)</label><input id="logDate" type="date"></div>
-          <div class="field"><label>Inspection Type</label>
-            <select id="logType">
-              <option value="OSI">OSI (On-Stream Inspection)</option>
-              <option value="Internal">Internal Inspection</option>
-              <option value="OSI-ADV">OSI Advanced NDT (PAUT/TOFD)</option>
-              <option value="NDT UT Thickness">NDT UT Wall Thickness</option>
-              <option value="Visual / CUI">Visual / CUI Surveillance</option>
-              <option value="Other">Other Evaluation</option>
-            </select>
-          </div>
-        </div>
-        <div class="field-grid">
-          <div class="field"><label>Inspector Name & Certification</label><input id="logInspector" placeholder="e.g. M. Ahmed (API 570 #4421)"></div>
-          <div class="field"><label>NDT Technique</label><input id="logMethod" placeholder="e.g. Digital UT, MPT, Visual"></div>
-        </div>
-        <div class="field-grid">
-          <div class="field"><label>Actual Measured Min Thickness t_act (mm)</label><input id="logTActual" placeholder="e.g. 5.8 mm"></div>
-          <div class="field"><label>Corrective Action Required?</label><input id="logAction" placeholder="e.g. None / Turnaround Scope"></div>
-        </div>
-        <div class="field-grid wide">
-          <div class="field"><label>Findings & Observations</label><textarea id="logFindings" placeholder="Document wall thinning, corrosion patterns, coating condition, recommendations…"></textarea></div>
-        </div>
-        <div class="field-grid">
-          <div class="field"><label>Next Scheduled Due Date (YYYY-MM-DD)</label><input id="logNextDue" type="date"></div>
-        </div>
-        <div class="drawer-actions" style="margin-top:12px; margin-bottom:24px;">
-          <button id="btnAddLog" class="btn primary">💾 Save Inspection Record</button>
-        </div>
-
-        ${a.log && a.log.length ? `
-          <div class="section-title">Historical Inspection & NDT Log</div>
-          ${a.log.map(l => `<div class="log-entry">
-            <div class="meta">${esc(l.insp_date || "Date N/A")} · ${esc(l.insp_type || "Inspection")}${l.insp_method ? " · " + esc(l.insp_method) : ""}${l.next_due_date ? " · Next Due: " + esc(l.next_due_date) : ""}</div>
-            ${l.inspector_name ? `<div style="font-weight:600; font-size:12px; color:var(--accent);">Inspector: ${esc(l.inspector_name)}</div>` : ""}
-            ${l.t_actual ? `<div style="font-size:12px; color:var(--text-muted);">Measured Wall Thickness: <b>${esc(l.t_actual)}</b></div>` : ""}
-            ${l.action_required ? `<div style="font-size:12px; color:var(--amber);">Action: ${esc(l.action_required)}</div>` : ""}
-            <div style="margin-top:6px; color:#fff; font-size:12.5px;">${esc(l.findings || "")}</div>
-            <button class="btn danger small" style="position:absolute; top:10px; right:10px;" onclick="deleteLog(${a.id}, ${l.id})">Delete</button>
-          </div>`).join("")}
-        ` : `<div style="color:var(--text-faint); font-size:12.5px; margin-top:8px;">No historical inspection logs recorded yet.</div>`}
-      </div>
-
-      <div class="drawer-actions" style="margin-top:24px; border-top:1px solid var(--border); padding-top:16px;">
-        <button id="btnSaveAsset" class="btn primary">💾 Save Changes</button>
-        <button id="btnArchiveAsset" class="btn danger">${a.archived ? "♻️ Restore Asset" : "📦 Archive Asset"}</button>
-      </div>
-    `;
-
-    document.getElementById("btnSaveAsset")?.addEventListener("click", () => saveAsset(id));
-    document.getElementById("btnArchiveAsset")?.addEventListener("click", () => toggleArchive(id, !a.archived));
-    document.getElementById("btnAddLog")?.addEventListener("click", () => addLog(id));
-
-    if (overlay) overlay.classList.add("open");
-  } catch (err) {
-    showToast("Failed to open asset details: " + err.message);
-  }
-}
-
-window.switchDrawerTab = function(tabName) {
-  document.querySelectorAll(".drawer-tab").forEach(t => t.classList.remove("active"));
-  document.querySelectorAll(".dtab-content").forEach(c => c.style.display = "none");
-  
-  const btn = document.getElementById("tabbtn-" + tabName);
-  if (btn) btn.classList.add("active");
-  const tabContent = document.getElementById("dtab-" + tabName);
-  if (tabContent) tabContent.style.display = "block";
-};
-
-async function saveAsset(id) {
-  const inputs = document.querySelectorAll("#drawerBody [data-field]");
-  const payload = {};
-  inputs.forEach(el => { payload[el.dataset.field] = el.value || null; });
-  try {
-    await api("/api/assets/" + id, {
-      method: "PUT",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
-    closeDrawer();
-    refreshCurrentView();
-    showToast("Asset changes saved successfully!", false);
-  } catch (err) {
-    showToast("Save failed: " + err.message);
-  }
-}
-
-async function toggleArchive(id, archived) {
-  try {
-    await api("/api/assets/" + id, {
-      method: "PUT",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({archived: archived ? 1 : 0}),
-    });
-    closeDrawer();
-    refreshCurrentView();
-    showToast(`Asset ${archived ? "archived" : "restored"}`, false);
-  } catch (err) {
-    showToast("Archive toggle failed: " + err.message);
-  }
-}
-
-async function addLog(id) {
-  const dateVal = document.getElementById("logDate")?.value;
-  const nextDueVal = document.getElementById("logNextDue")?.value;
-
-  const payload = {
-    insp_date: dateVal ? dateVal.trim() : null,
-    insp_type: document.getElementById("logType")?.value || "OSI",
-    inspector_name: document.getElementById("logInspector")?.value?.trim() || null,
-    insp_method: document.getElementById("logMethod")?.value?.trim() || null,
-    t_actual: document.getElementById("logTActual")?.value?.trim() || null,
-    action_required: document.getElementById("logAction")?.value?.trim() || null,
-    findings: document.getElementById("logFindings")?.value?.trim() || null,
-    next_due_date: nextDueVal ? nextDueVal.trim() : null,
-  };
-
-  try {
-    await api("/api/assets/" + id + "/log", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      body: JSON.stringify(payload),
-    });
-    showToast("Inspection record added successfully!", false);
-    openAssetDrawer(id);
-    refreshCurrentView();
-  } catch (err) {
-    showToast("Failed to add inspection log: " + err.message);
-  }
-}
-
-window.deleteLog = async function(assetId, logId) {
-  if (!confirm("Are you sure you want to delete this inspection record?")) return;
-  try {
-    await api("/api/logs/" + logId, { method: "DELETE" });
-    showToast("Inspection record removed", false);
-    openAssetDrawer(assetId);
-    refreshCurrentView();
-  } catch (err) {
-    showToast("Failed to delete log: " + err.message);
-  }
-};
-
-function refreshCurrentView() {
-  if (state.view === "dashboard") loadDashboard();
-  if (state.view === "assets") loadAssets();
-  if (state.view === "critical") loadCriticalAssets();
-  if (state.view === "temprepairs") loadTempRepairs();
-  if (state.view === "yearly") loadYearlyPlan();
 }
 
 // ---------------------------------------------------------------- Create New Asset
@@ -912,10 +1273,6 @@ document.getElementById("btnNewAsset")?.addEventListener("click", () => {
     <div class="section-title">Design & Operating Envelope</div>
     <div class="field-grid">
       ${ENVELOPE_FIELDS.map(([k,l]) => fieldInput(k,l,"")).join("")}
-    </div>
-    <div class="section-title">Risk Profile</div>
-    <div class="field-grid">
-      ${RISK_FIELDS.map(([k,l]) => fieldInput(k,l,"")).join("")}
     </div>
     <div class="section-title">Initial Scheduled Due Dates</div>
     <div class="field-grid">
@@ -950,7 +1307,7 @@ async function createAsset() {
     showToast(`Created asset: ${a.name || "Asset #" + a.id}`, false);
     openAssetDrawer(a.id);
   } catch (err) {
-    showToast("Failed to create asset: " + err.message);
+    showToast("Failed to create asset: " + err.message, true);
   }
 }
 

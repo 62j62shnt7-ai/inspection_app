@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-app.py — Master Inspection Plan web app.
+app.py — Master Inspection Plan & Asset Integrity Management Suite.
 
-Standard library only (http.server + sqlite3) — no pip installs needed to
-RUN this, which matters on a locked-down corporate Windows machine. Only the
-one-time import_excel.py step (run on your Mac) needs openpyxl.
+Standard library only (http.server + sqlite3) — no pip installs needed.
+Runs completely standalone on restricted machines with embedded or system Python.
 
 Usage:
     python3 app.py [path/to/inspection_plan.db] [port]
-
-Then open http://localhost:8642 in your browser.
 """
 import sys
 import os
@@ -39,20 +36,22 @@ if not os.path.exists(DB_PATH):
 def get_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    # Enable WAL mode for better concurrency
     try:
         conn.execute("PRAGMA journal_mode=WAL")
     except Exception:
         pass
     
-    # Auto-migrate schema for AIMS columns if missing
+    # Auto-migrate schema for AIMS & Integrity columns
     cur = conn.cursor()
     asset_cols = [r[1] for r in cur.execute("PRAGMA table_info(assets)").fetchall()]
     new_cols = [
         ("fluid_service", "TEXT"), ("design_pressure", "TEXT"), ("design_temp", "TEXT"),
         ("operating_pressure", "TEXT"), ("operating_temp", "TEXT"), ("material_spec", "TEXT"),
         ("nominal_thickness", "TEXT"), ("t_min", "TEXT"), ("risk_category", "TEXT"),
-        ("damage_mechanisms", "TEXT"), ("cui_susceptible", "INTEGER")
+        ("damage_mechanisms", "TEXT"), ("cui_susceptible", "INTEGER"),
+        ("deferral_status", "TEXT"), ("deferral_reason", "TEXT"), ("deferral_mitigation", "TEXT"),
+        ("deferral_expiry", "TEXT"), ("deferral_approver", "TEXT"), ("deferral_moc_no", "TEXT"),
+        ("pof_score", "INTEGER"), ("cof_score", "INTEGER")
     ]
     for col_name, col_type in new_cols:
         if col_name not in asset_cols:
@@ -76,6 +75,9 @@ ASSET_COLUMNS = frozenset([
     "fluid_service", "design_pressure", "design_temp", "operating_pressure",
     "operating_temp", "material_spec", "nominal_thickness", "t_min",
     "risk_category", "damage_mechanisms", "cui_susceptible",
+    "deferral_status", "deferral_reason", "deferral_mitigation",
+    "deferral_expiry", "deferral_approver", "deferral_moc_no",
+    "pof_score", "cof_score",
     "remarks", "archived",
 ])
 
@@ -87,6 +89,65 @@ def today():
     return datetime.date.today().isoformat()
 
 
+def calculate_pof_cof(row_dict):
+    """Calculate API 580 POF (1-5 / A-E) and COF (1-5) based on engineering parameters."""
+    # Probability of Failure (POF) 1 to 5:
+    pof = 2
+    
+    # 1. Remaining life factor
+    rl_str = str(row_dict.get("remaining_life") or "")
+    rl_m = re.search(r"(\d+(?:\.\d+)?)", rl_str)
+    if rl_m:
+        try:
+            rl = float(rl_m.group(1))
+            if rl <= 2.0: pof = max(pof, 5)
+            elif rl <= 5.0: pof = max(pof, 4)
+            elif rl <= 10.0: pof = max(pof, 3)
+        except ValueError:
+            pass
+
+    # 2. Overdue factor
+    nd = row_dict.get("next_due")
+    if nd and nd < today():
+        try:
+            days_overdue = (datetime.date.today() - datetime.date.fromisoformat(nd)).days
+            if days_overdue > 180: pof = max(pof, 5)
+            elif days_overdue > 60: pof = max(pof, 4)
+            elif days_overdue > 0: pof = max(pof, 3)
+        except Exception:
+            pass
+
+    # 3. CUI factor
+    if row_dict.get("is_cui"):
+        pof = min(5, pof + 1)
+
+    # Consequence of Failure (COF) 1 to 5:
+    cof = 2
+    sheet = (row_dict.get("source_sheet") or "").lower()
+    fluid = str(row_dict.get("fluid_service") or "").lower()
+    name = (row_dict.get("name") or "").lower()
+
+    if any(k in sheet or k in fluid or k in name for k in ["h2s", "acid", "lethal", "flare", "turbines", "vessels & tks", "gp inlet"]):
+        cof = 5
+    elif any(k in sheet or k in fluid or k in name for k in ["gas", "condensate", "fuel", "high press", "op piping", "gp piping", "epf"]):
+        cof = 4
+    elif any(k in sheet or k in fluid or k in name for k in ["crude", "oil", "coolers", "mfds", "tl", "fl"]):
+        cof = 3
+    elif any(k in sheet or k in fluid or k in name for k in ["water", "drain", "utility", "air"]):
+        cof = 1
+
+    # Overall Risk Category mapping
+    risk_score = pof * cof
+    if risk_score >= 16 or cof == 5 and pof >= 3 or pof == 5 and cof >= 3:
+        risk_cat = "HIGH"
+    elif risk_score >= 8:
+        risk_cat = "MEDIUM"
+    else:
+        risk_cat = "LOW"
+
+    return pof, cof, risk_cat
+
+
 def row_to_dict(row):
     d = dict(row)
     try:
@@ -95,8 +156,7 @@ def row_to_dict(row):
         d["extra"] = {}
     d.pop("extra_json", None)
 
-    # Calculate CUI (Corrosion Under Insulation) susceptibility:
-    # Operating temperature between 10C and 175C (or 50F to 350F) with Insulation present
+    # CUI Susceptibility
     insul = str(d.get("insulation") or "").strip().lower()
     has_insulation = insul not in ("", "none", "no", "n/a", "0", "false")
     
@@ -112,7 +172,6 @@ def row_to_dict(row):
     if d.get("cui_susceptible") is not None:
         d["is_cui"] = str(d.get("cui_susceptible")).strip().lower() in ("1", "yes", "true")
     else:
-        # Auto detect based on insulation & temperature envelope
         if has_insulation and op_temp_val is not None:
             d["is_cui"] = 10.0 <= op_temp_val <= 175.0
         elif has_insulation:
@@ -120,31 +179,56 @@ def row_to_dict(row):
         else:
             d["is_cui"] = False
 
-    # Risk Category default assignment if missing
-    risk = str(d.get("risk_category") or "").strip().upper()
-    if risk not in ("HIGH", "MEDIUM", "LOW"):
-        rl_str = str(d.get("remaining_life") or "")
-        try:
-            rl_val = float(re.search(r"(\d+(?:\.\d+)?)", rl_str).group(1)) if re.search(r"(\d+(?:\.\d+)?)", rl_str) else None
-        except Exception:
-            rl_val = None
-
-        if rl_val is not None and rl_val <= 3.0:
-            risk = "HIGH"
-        elif rl_val is not None and rl_val <= 10.0:
-            risk = "MEDIUM"
-        else:
-            risk = "LOW"
-    d["risk_category"] = risk
-
-    # Earliest real upcoming/overdue date among the tracked due-date fields
+    # Earliest upcoming/overdue date
     due_candidates = [d.get("date_osi_next"), d.get("date_internal_next")]
     due_candidates = [x for x in due_candidates if x]
     d["next_due"] = min(due_candidates) if due_candidates else None
+    
+    # Overdue & Aging calculation
     if d["next_due"]:
         d["overdue"] = d["next_due"] < today()
+        if d["overdue"]:
+            try:
+                days = (datetime.date.today() - datetime.date.fromisoformat(d["next_due"])).days
+                d["days_overdue"] = days
+                if days <= 30: d["aging_bucket"] = "0_30"
+                elif days <= 90: d["aging_bucket"] = "31_90"
+                elif days <= 180: d["aging_bucket"] = "91_180"
+                else: d["aging_bucket"] = "180_plus"
+            except Exception:
+                d["days_overdue"] = 0
+                d["aging_bucket"] = "0_30"
+        else:
+            d["days_overdue"] = 0
+            d["aging_bucket"] = "current"
     else:
         d["overdue"] = False
+        d["days_overdue"] = 0
+        d["aging_bucket"] = "no_date"
+
+    # POF / COF / Risk calculation
+    pof, cof, auto_risk = calculate_pof_cof(d)
+    d["pof_score"] = d.get("pof_score") or pof
+    d["cof_score"] = d.get("cof_score") or cof
+    
+    # POF letter code (1=A, 2=B, 3=C, 4=D, 5=E)
+    pof_letters = {1: "A", 2: "B", 3: "C", 4: "D", 5: "E"}
+    d["pof_letter"] = pof_letters.get(d["pof_score"], "B")
+    d["rbi_matrix_cell"] = f"{d['cof_score']}{d['pof_letter']}"
+
+    existing_risk = str(d.get("risk_category") or "").strip().upper()
+    d["risk_category"] = existing_risk if existing_risk in ("HIGH", "MEDIUM", "LOW") else auto_risk
+
+    # Deferral Status Check
+    def_stat = str(d.get("deferral_status") or "None").strip()
+    def_exp = d.get("deferral_expiry")
+    if def_stat == "Approved" and def_exp:
+        d["is_deferred"] = def_exp >= today()
+        if not d["is_deferred"]:
+            d["deferral_status"] = "Expired"
+    else:
+        d["is_deferred"] = False
+
     return d
 
 
@@ -154,12 +238,14 @@ def api_list_assets(params):
     overdue_only = params.get("overdue", ["0"])[0] == "1"
     include_archived = params.get("archived", ["0"])[0] == "1"
     risk_filter = params.get("risk", [""])[0].strip().upper()
+    aging_filter = params.get("aging", [""])[0].strip()
+    rbi_cell_filter = params.get("rbi_cell", [""])[0].strip().upper()
+    deferral_filter = params.get("deferral", [""])[0].strip()
 
     sql = "SELECT * FROM assets WHERE 1=1"
     args = []
     
     if q:
-        # Robust FTS5 tokenization
         tokens = [t for t in re.findall(r"[\w]+", q) if t]
         if tokens:
             fts_query = " ".join([f'"{t}"*' for t in tokens])
@@ -167,14 +253,11 @@ def api_list_assets(params):
                 sql = "SELECT * FROM assets WHERE id IN (SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?) "
                 args.append(fts_query)
             except Exception:
-                # Fallback to standard LIKE
                 sql = "SELECT * FROM assets WHERE (name LIKE ? OR tag LIKE ? OR asset_number LIKE ? OR remarks LIKE ? OR fluid_service LIKE ? OR field LIKE ?) "
-                pattern = f"%{q}%"
-                args = [pattern] * 6
+                args = [f"%{q}%"] * 6
         else:
             sql = "SELECT * FROM assets WHERE (name LIKE ? OR tag LIKE ? OR asset_number LIKE ? OR remarks LIKE ?) "
-            pattern = f"%{q}%"
-            args = [pattern] * 4
+            args = [f"%{q}%"] * 4
 
     if not include_archived:
         sql += " AND archived = 0"
@@ -186,7 +269,6 @@ def api_list_assets(params):
         try:
             raw_rows = CONN.execute(sql, args).fetchall()
         except sqlite3.OperationalError:
-            # Fallback if FTS table syntax issue occurred
             sql_fallback = "SELECT * FROM assets WHERE (name LIKE ? OR tag LIKE ? OR asset_number LIKE ? OR remarks LIKE ?) "
             if not include_archived:
                 sql_fallback += " AND archived = 0"
@@ -202,6 +284,17 @@ def api_list_assets(params):
         rows = [r for r in rows if r["overdue"]]
     if risk_filter in ("HIGH", "MEDIUM", "LOW"):
         rows = [r for r in rows if r["risk_category"] == risk_filter]
+    if aging_filter:
+        rows = [r for r in rows if r.get("aging_bucket") == aging_filter]
+    if rbi_cell_filter:
+        rows = [r for r in rows if r.get("rbi_matrix_cell") == rbi_cell_filter]
+    if deferral_filter:
+        if deferral_filter == "deferred":
+            rows = [r for r in rows if r.get("is_deferred")]
+        elif deferral_filter == "unmanaged":
+            rows = [r for r in rows if r["overdue"] and not r.get("is_deferred")]
+        else:
+            rows = [r for r in rows if (r.get("deferral_status") or "").lower() == deferral_filter.lower()]
 
     rows.sort(key=lambda r: (r["next_due"] is None, r["next_due"] or ""))
     return rows
@@ -222,6 +315,29 @@ def api_dashboard():
     expired_repairs = [tr for tr in temp_repairs if (tr.get("expiration_status") or "").lower() == "expired" or (tr.get("expiration_date") and tr.get("expiration_date") < today())]
     pending_critical = [ca for ca in critical_assets if (ca.get("replacement_done") or "").lower() not in ("yes", "1", "true", "completed")]
 
+    # Overdue Aging Triage breakdown
+    aging_counts = {
+        "0_30": len([r for r in overdue if r.get("aging_bucket") == "0_30"]),
+        "31_90": len([r for r in overdue if r.get("aging_bucket") == "31_90"]),
+        "91_180": len([r for r in overdue if r.get("aging_bucket") == "91_180"]),
+        "180_plus": len([r for r in overdue if r.get("aging_bucket") == "180_plus"]),
+        "approved_deferrals": len([r for r in overdue if r.get("is_deferred")]),
+        "unmanaged_overdue": len([r for r in overdue if not r.get("is_deferred")]),
+    }
+
+    # 5x5 RBI Matrix distribution
+    rbi_matrix = {}
+    pof_letters = ["A", "B", "C", "D", "E"]
+    for cof in range(1, 6):
+        for pof_l in pof_letters:
+            cell_key = f"{cof}{pof_l}"
+            rbi_matrix[cell_key] = 0
+
+    for r in rows:
+        cell = r.get("rbi_matrix_cell")
+        if cell in rbi_matrix:
+            rbi_matrix[cell] += 1
+
     in_30 = []
     in_90 = []
     d30 = (datetime.date.today() + datetime.timedelta(days=30)).isoformat()
@@ -237,14 +353,19 @@ def api_dashboard():
 
     by_sheet = {}
     for r in rows:
-        by_sheet.setdefault(r["source_sheet"], {"total": 0, "overdue": 0})
+        by_sheet.setdefault(r["source_sheet"], {"total": 0, "overdue": 0, "high_risk": 0})
         by_sheet[r["source_sheet"]]["total"] += 1
         if r["overdue"]:
             by_sheet[r["source_sheet"]]["overdue"] += 1
+        if r["risk_category"] == "HIGH":
+            by_sheet[r["source_sheet"]]["high_risk"] += 1
 
     overdue.sort(key=lambda r: r["next_due"])
+    compliance_rate = round(((len(rows) - len(overdue)) / max(1, len(rows))) * 100, 1)
+
     return {
         "total_assets": len(rows),
+        "compliance_rate": compliance_rate,
         "overdue_count": len(overdue),
         "high_risk_count": len(high_risk),
         "cui_count": len(cui_flagged),
@@ -254,6 +375,8 @@ def api_dashboard():
         "pending_critical_count": len(pending_critical),
         "due_30_count": len(in_30),
         "due_90_count": len(in_90),
+        "aging_counts": aging_counts,
+        "rbi_matrix": rbi_matrix,
         "overdue": overdue[:200],
         "due_30": sorted(in_30, key=lambda r: r["next_due"])[:200],
         "high_risk": high_risk[:200],
@@ -261,6 +384,141 @@ def api_dashboard():
         "pending_critical": pending_critical[:50],
         "by_sheet": by_sheet,
         "sheets": sorted(by_sheet.keys()),
+    }
+
+
+def api_calculate_remaining_life(payload):
+    """API 510/570 Remaining Life & Interval Calculator."""
+    try:
+        t_act = float(payload.get("t_act") or 0)
+        t_prev = float(payload.get("t_prev") or t_act)
+        t_min = float(payload.get("t_min") or 0)
+        years = float(payload.get("years_between") or 0)
+        
+        # Calculate years between dates if provided
+        d_act = payload.get("d_act")
+        d_prev = payload.get("d_prev")
+        if (not years or years <= 0) and d_act and d_prev:
+            dt_act = datetime.date.fromisoformat(d_act)
+            dt_prev = datetime.date.fromisoformat(d_prev)
+            days = abs((dt_act - dt_prev).days)
+            years = max(0.1, days / 365.25)
+            
+        if years <= 0:
+            years = 1.0
+
+        corrosion_loss = max(0.0, t_prev - t_act)
+        cr = round(corrosion_loss / years, 3) # mm/yr
+
+        if t_act <= t_min:
+            rl = 0.0
+            next_interval_yrs = 0.0
+        elif cr <= 0:
+            rl = 99.0
+            next_interval_yrs = 10.0 if payload.get("piping_class") != "Class 1" else 5.0
+        else:
+            rl = round((t_act - t_min) / cr, 1) # years
+            max_limit = 5.0 if payload.get("piping_class") == "Class 1" else 10.0
+            next_interval_yrs = round(min(rl / 2.0, max_limit), 1)
+
+        base_date = datetime.date.fromisoformat(d_act) if d_act else datetime.date.today()
+        days_to_add = int(next_interval_yrs * 365.25)
+        suggested_due = (base_date + datetime.timedelta(days=days_to_add)).isoformat()
+
+        return {
+            "success": True,
+            "corrosion_rate_mm_yr": cr,
+            "remaining_life_years": rl,
+            "half_life_interval_years": next_interval_yrs,
+            "suggested_next_due_date": suggested_due,
+            "t_min": t_min,
+            "t_act": t_act,
+            "loss_mm": round(corrosion_loss, 3)
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def api_bulk_log(payload):
+    """Batch log inspection activities across multiple assets."""
+    asset_ids = payload.get("asset_ids", [])
+    if not asset_ids:
+        raise ValueError("No asset IDs selected for bulk logging.")
+
+    insp_date = _validate_iso_date(payload.get("insp_date"), "insp_date") or today()
+    next_due = _validate_iso_date(payload.get("next_due_date"), "next_due_date")
+    insp_type = (payload.get("insp_type") or "OSI").upper()
+    inspector_name = payload.get("inspector_name") or "Bulk Batch Entry"
+    insp_method = payload.get("insp_method") or "Visual / Ultrasonic"
+    findings = payload.get("findings") or "Routine batch inspection completed."
+    t_actual = payload.get("t_actual")
+    action_required = payload.get("action_required")
+
+    is_osi = "OSI" in insp_type
+    last_field = "date_osi_last" if is_osi else "date_internal_last"
+    next_field = "date_osi_next" if is_osi else "date_internal_next"
+
+    with CONN_LOCK:
+        try:
+            CONN.execute("ALTER TABLE inspection_log ADD COLUMN inspector_name TEXT")
+            CONN.execute("ALTER TABLE inspection_log ADD COLUMN insp_method TEXT")
+            CONN.execute("ALTER TABLE inspection_log ADD COLUMN t_actual TEXT")
+            CONN.execute("ALTER TABLE inspection_log ADD COLUMN action_required TEXT")
+        except Exception:
+            pass
+
+        count = 0
+        for aid in asset_ids:
+            CONN.execute("""
+                INSERT INTO inspection_log (asset_id, insp_date, insp_type, findings, next_due_date, inspector_name, insp_method, t_actual, action_required)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (aid, insp_date, insp_type, findings, next_due, inspector_name, insp_method, t_actual, action_required))
+            
+            updates = [f"{last_field} = ?"]
+            params = [insp_date]
+            if next_due:
+                updates.append(f"{next_field} = ?")
+                params.append(next_due)
+            params.append(aid)
+            CONN.execute(f"UPDATE assets SET {', '.join(updates)} WHERE id = ?", params)
+            count += 1
+            
+        CONN.commit()
+
+    return {
+        "success": True,
+        "message": f"Successfully logged {insp_type} inspection for {count} assets.",
+        "updated_count": count
+    }
+
+
+def api_bulk_deferral(payload):
+    """Batch apply inspection deferral concessions."""
+    asset_ids = payload.get("asset_ids", [])
+    if not asset_ids:
+        raise ValueError("No asset IDs selected for bulk deferral.")
+
+    status = payload.get("deferral_status") or "Approved"
+    reason = payload.get("deferral_reason") or "Plant continuous operation concession"
+    mitigation = payload.get("deferral_mitigation") or "Interim online UT surveillance"
+    expiry = _validate_iso_date(payload.get("deferral_expiry"), "deferral_expiry")
+    approver = payload.get("deferral_approver") or "Technical Authority"
+    moc_no = payload.get("deferral_moc_no") or "MOC-2026-AIMS"
+
+    with CONN_LOCK:
+        for aid in asset_ids:
+            CONN.execute("""
+                UPDATE assets SET
+                    deferral_status = ?, deferral_reason = ?, deferral_mitigation = ?,
+                    deferral_expiry = ?, deferral_approver = ?, deferral_moc_no = ?
+                WHERE id = ?
+            """, (status, reason, mitigation, expiry, approver, moc_no, aid))
+        CONN.commit()
+
+    return {
+        "success": True,
+        "message": f"Successfully applied {status} deferral to {len(asset_ids)} assets.",
+        "updated_count": len(asset_ids)
     }
 
 
@@ -415,7 +673,6 @@ def api_create_asset(payload):
 
 
 def _validate_iso_date(value, field_name):
-    """Return the value if it's a valid YYYY-MM-DD string, else raise."""
     if value is None or str(value).strip() == "":
         return None
     val_str = str(value).strip()
@@ -510,18 +767,15 @@ def api_export_csv(params):
 
 
 def _backup_db():
-    """Create a timestamped backup of the database before destructive reimport."""
     if os.path.exists(DB_PATH):
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         backup = f"{DB_PATH}.bak.{ts}"
         shutil.copy2(DB_PATH, backup)
-        print(f"Database backed up to: {backup}")
         return backup
     return None
 
 
 def _do_reimport(xlsx_path, display_name):
-    """Shared reimport logic: backup DB, run import, reconnect."""
     import import_excel
     _backup_db()
     with CONN_LOCK:
@@ -539,17 +793,6 @@ def _do_reimport(xlsx_path, display_name):
         "total_assets": row_count,
         "excel_file": display_name,
     }
-
-
-def api_reimport(payload=None):
-    xlsx_file = (payload or {}).get("xlsx_path") or "1. Master Inspection Plan - Updated 4-6-2026.xlsx"
-    if not os.path.exists(xlsx_file):
-        cwd_files = [f for f in os.listdir(".") if f.endswith(".xlsx") and not f.startswith("~$")]
-        if cwd_files:
-            xlsx_file = cwd_files[0]
-        else:
-            raise FileNotFoundError(f"Excel file not found: {xlsx_file}")
-    return _do_reimport(xlsx_file, os.path.basename(xlsx_file))
 
 
 def api_reimport_file(payload):
@@ -578,10 +821,8 @@ def api_delete_log(log_id):
         insp_type = (row["insp_type"] or "").upper()
         is_osi = "OSI" in insp_type
 
-        # Delete log entry
         CONN.execute("DELETE FROM inspection_log WHERE id = ?", (log_id,))
 
-        # Recalculate latest inspection & next due date for this asset from remaining logs
         logs = CONN.execute(
             "SELECT insp_date, next_due_date, insp_type FROM inspection_log WHERE asset_id = ? ORDER BY insp_date DESC",
             (asset_id,)).fetchall()
@@ -602,7 +843,6 @@ def api_delete_log(log_id):
     return api_get_asset(asset_id)
 
 
-# MIME types for static file serving
 mimetypes.init()
 MIME_OVERRIDES = {
     ".js": "application/javascript",
@@ -715,12 +955,16 @@ class Handler(BaseHTTPRequestHandler):
             payload = self._read_json_body()
             if path == "/api/assets":
                 self._send_json(api_create_asset(payload))
+            elif path == "/api/assets/bulk-log":
+                self._send_json(api_bulk_log(payload))
+            elif path == "/api/assets/bulk-deferral":
+                self._send_json(api_bulk_deferral(payload))
+            elif path == "/api/calc/remaining-life":
+                self._send_json(api_calculate_remaining_life(payload))
             elif path == "/api/temp_repairs":
                 self._send_json(api_create_temp_repair(payload))
             elif path == "/api/critical_assets":
                 self._send_json(api_create_critical_asset(payload))
-            elif path == "/api/reimport":
-                self._send_json(api_reimport(payload))
             elif path == "/api/reimport_file":
                 self._send_json(api_reimport_file(payload))
             elif path.endswith("/log") and path.startswith("/api/assets/"):
@@ -742,6 +986,10 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/api/critical_assets/"):
                 critical_id = int(path.rsplit("/", 1)[-1])
                 self._send_json(api_update_critical_asset(critical_id, payload))
+            elif path.startswith("/api/assets/") and path.endswith("/deferral"):
+                asset_id = int(path.split("/")[3])
+                res = api_update_asset(asset_id, payload)
+                self._send_json(res)
             elif path.startswith("/api/assets/"):
                 asset_id = int(path.rsplit("/", 1)[-1])
                 self._send_json(api_update_asset(asset_id, payload))
