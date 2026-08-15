@@ -1,14 +1,9 @@
 #!/usr/bin/env python3
 """
-import_excel.py — Smart, Resilient Importer for Master Inspection Plan Excel workbooks.
+import_excel.py — Precision Engineered Importer for Master Inspection Plan Excel workbooks.
 
-Features:
-- Dynamic Header & Schema Auto-Detection with Fuzzy Synonym Matching.
-- Header Row Auto-Discovery (handles title/banner rows).
-- Smart Unit & Number Cleansing (temp, pressure, thickness, corrosion rate, remaining life).
-- Ingestion-Time CUI & API 580 POF/COF Risk Auto-Classification.
-- Non-Destructive Upsert Mode OR Clean Wipe Mode.
-- Specialized Turnaround Critical Scope & Temporary Repair table importers.
+Accurately maps every sheet's unique layout, columns, dates, envelope specs, and remarks
+without column misalignments.
 """
 import sys
 import os
@@ -32,7 +27,7 @@ SKIP_SHEETS = {
 
 MONTH_MAP = {
     "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
-    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
+    "june": 6, "july": 7, "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12
 }
 
 DATE_PATTERNS = [
@@ -40,37 +35,11 @@ DATE_PATTERNS = [
     re.compile(r"^\s*(\d{1,2})[-/](\d{4})\s*$"),                          # 09/2024, 9-2024
     re.compile(r"^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*$"),            # 2024-09-15
     re.compile(r"^\s*(\d{1,2})[-/](\d{1,2})[-/](\d{4})\s*$"),            # 15/09/2024 or 09/15/2024
-    re.compile(r"^\s*([A-Za-z]{3})[-/ ](\d{4})\s*$"),                    # Sep-2024, Sep 2024
-    re.compile(r"^\s*(\d{1,2})[-/ ]([A-Za-z]{3})[-/ ](\d{4})\s*$"),       # 15-Sep-2024
+    re.compile(r"^\s*([A-Za-z]+)\s*[-/ ]\s*(\d{4})\s*$"),                # Sep-2024, June 2024
+    re.compile(r"^\s*([A-Za-z]+)\s*[-/ ]\s*(\d{2})\s*$"),                # June -19, Jun-22
+    re.compile(r"^\s*(\d{1,2})\s*[-/ ]\s*([A-Za-z]+)\s*[-/ ]\s*(\d{4})\s*$"),  # 15-Sep-2024
+    re.compile(r"^\s*(\d{1,2})\s*[-/ ]\s*([A-Za-z]+)\s*[-/ ]\s*(\d{2})\s*$"),    # 15-Sep-24
     re.compile(r"^\s*Q([1-4])[-/ ](\d{4})\s*$", re.I),                   # Q3 2024
-]
-
-FIELD_SYNONYMS = [
-    (re.compile(r"^(s[\.\s/]?n|serial|no\.?|seq|item\s*no)$", re.I), "sn"),
-    (re.compile(r"(field|pack\s*(no|\#)?|package|header|section)", re.I), "field"),
-    (re.compile(r"(plant|facility|station|complex)", re.I), "plant"),
-    (re.compile(r"(location|area|deck|platform|sub[\s-]*system)", re.I), "location"),
-    (re.compile(r"(unit(\s*name)?|system(\s*name)?)", re.I), "unit_name"),
-    (re.compile(r"^(asset(\s*name)?|equipment(\s*name)?|description|item(\s*description)?|line(\s*description)?)$", re.I), "name"),
-    (re.compile(r"(tag(\s*no|\s*#)?|equipment\s*tag|line\s*no|line\s*#|spool(\s*no|\s*#)?|iso(\s*no|\s*#)?)", re.I), "tag"),
-    (re.compile(r"(asset\s*(no|\#|id|number)|equip\s*(no|\#|id))", re.I), "asset_number"),
-    (re.compile(r"(in[\s_-]*service|operational\s*status|status)", re.I), "in_service"),
-    (re.compile(r"(insul(ation)?(\s*type)?|cladding|lagging)", re.I), "insulation"),
-    (re.compile(r"(last\s*(osi|on[\s-]*stream|external)|date\s*last\s*osi|last\s*insp(\w*\s*)?date)", re.I), "date_osi_last"),
-    (re.compile(r"(next\s*(osi|on[\s-]*stream|external)|date\s*next\s*osi|next\s*insp(\w*\s*)?date|next\s*due|due\s*date)", re.I), "date_osi_next"),
-    (re.compile(r"(last\s*(internal|int(\.)?|major)|date\s*last\s*internal)", re.I), "date_internal_last"),
-    (re.compile(r"(next\s*(internal|int(\.)?|major)|date\s*next\s*internal)", re.I), "date_internal_next"),
-    (re.compile(r"(fluid(\s*service)?|medium|service|product|process(\s*fluid)?)", re.I), "fluid_service"),
-    (re.compile(r"(design\s*press(ure)?|p_?des|dp\s*\(|des\.\s*press)", re.I), "design_pressure"),
-    (re.compile(r"(design\s*temp(erature)?|t_?des|dt\s*\(|des\.\s*temp)", re.I), "design_temp"),
-    (re.compile(r"(operat(ing)?\s*press(ure)?|p_?op|op\s*\(|op\.\s*press)", re.I), "operating_pressure"),
-    (re.compile(r"(operat(ing)?\s*temp(erature)?|t_?op|ot\s*\(|op\.\s*temp)", re.I), "operating_temp"),
-    (re.compile(r"(material(\s*spec)?|metallurgy|pipe\s*mat|spec)", re.I), "material_spec"),
-    (re.compile(r"(nominal\s*(thk|thickness|wall)|t_?nom|sch(edule)?)", re.I), "nominal_thickness"),
-    (re.compile(r"(t_?min|min(\w*\s*)?(thk|thickness|wall)|retire(ment)?\s*thk)", re.I), "t_min"),
-    (re.compile(r"(corr(osion)?\s*rate|cr\s*\(|short\s*term\s*cr|long\s*term\s*cr)", re.I), "corrosion_rate"),
-    (re.compile(r"(remain(ing)?\s*life|rem\s*life|rl\s*\()", re.I), "remaining_life"),
-    (re.compile(r"(remark(s)?|comment(s)?|note(s)?|recommendation(s)?|finding(s)?)", re.I), "remarks"),
 ]
 
 import_errors = []
@@ -114,15 +83,30 @@ def parse_date(value):
             month = p1 if 1 <= p1 <= 12 else (p2 if 1 <= p2 <= 12 else 1)
             day = p2 if p1 == month else p1
             return f"{year}-{month:02d}-{min(day, 28):02d}", text
-        elif idx == 4: # Sep-2024
-            mon_str, year = m.group(1).lower()[:3], m.group(2)
-            if mon_str in MONTH_MAP:
-                return f"{year}-{MONTH_MAP[mon_str]:02d}-01", text
-        elif idx == 5: # 15-Sep-2024
-            day, mon_str, year = int(m.group(1)), m.group(2).lower()[:3], m.group(3)
-            if mon_str in MONTH_MAP:
-                return f"{year}-{MONTH_MAP[mon_str]:02d}-{min(day, 28):02d}", text
-        elif idx == 6: # Q3 2024
+        elif idx == 4: # Sep-2024, June 2024
+            mon_str = m.group(1).lower()
+            mon_num = MONTH_MAP.get(mon_str) or MONTH_MAP.get(mon_str[:3])
+            if mon_num:
+                return f"{m.group(2)}-{mon_num:02d}-01", text
+        elif idx == 5: # June -19, Jun-22
+            mon_str = m.group(1).lower()
+            mon_num = MONTH_MAP.get(mon_str) or MONTH_MAP.get(mon_str[:3])
+            yr_2digit = int(m.group(2))
+            full_year = 2000 + yr_2digit if yr_2digit < 70 else 1900 + yr_2digit
+            if mon_num:
+                return f"{full_year}-{mon_num:02d}-01", text
+        elif idx == 6: # 15-Sep-2024
+            day, mon_str, year = int(m.group(1)), m.group(2).lower(), m.group(3)
+            mon_num = MONTH_MAP.get(mon_str) or MONTH_MAP.get(mon_str[:3])
+            if mon_num:
+                return f"{year}-{mon_num:02d}-{min(day, 28):02d}", text
+        elif idx == 7: # 15-Sep-24
+            day, mon_str, yr_2digit = int(m.group(1)), m.group(2).lower(), int(m.group(3))
+            mon_num = MONTH_MAP.get(mon_str) or MONTH_MAP.get(mon_str[:3])
+            full_year = 2000 + yr_2digit if yr_2digit < 70 else 1900 + yr_2digit
+            if mon_num:
+                return f"{full_year}-{mon_num:02d}-{min(day, 28):02d}", text
+        elif idx == 8: # Q3 2024
             qtr, year = int(m.group(1)), m.group(2)
             qtr_month = (qtr - 1) * 3 + 1
             return f"{year}-{qtr_month:02d}-01", text
@@ -137,30 +121,599 @@ def clean_str(val):
     return s if s else None
 
 
-def find_header_row_and_map(ws, max_scan_rows=12):
-    best_row = 1
-    best_score = 0
-    best_map = {}
+def gather_extra(ws, r, hdr_r, start_col):
+    extra = {}
+    for c in range(start_col, ws.max_column + 1):
+        hdr = ws.cell(row=hdr_r, column=c).value
+        val = ws.cell(row=r, column=c).value
+        if hdr and val is not None:
+            extra[str(hdr).strip().replace("\n", " ")] = str(val).strip()
+    return extra
 
-    for r in range(1, min(ws.max_row + 1, max_scan_rows + 1)):
-        col_map = {}
-        score = 0
-        for c in range(1, ws.max_column + 1):
-            val = ws.cell(row=r, column=c).value
-            if not val:
-                continue
-            hdr_str = str(val).strip()
-            for pat, field_name in FIELD_SYNONYMS:
-                if pat.search(hdr_str):
-                    col_map[c] = (field_name, hdr_str)
-                    score += 1
-                    break
-        if score > best_score:
-            best_score = score
-            best_row = r
-            best_map = col_map
 
-    return best_row, best_map
+def evaluate_cui_and_risk(record):
+    """Auto-computes CUI susceptibility and API 580 POF/COF at ingestion time."""
+    insul = str(record.get("insulation") or "").strip().lower()
+    has_insul = insul not in ("", "none", "no", "n/a", "0", "false")
+    
+    op_temp_str = str(record.get("operating_temp") or "")
+    op_temp_val = None
+    m = re.search(r"(-?\d+(?:\.\d+)?)", op_temp_str)
+    if m:
+        try:
+            op_temp_val = float(m.group(1))
+        except ValueError:
+            pass
+
+    if has_insul and op_temp_val is not None:
+        record["cui_susceptible"] = 1 if 10.0 <= op_temp_val <= 175.0 else 0
+    elif has_insul:
+        record["cui_susceptible"] = 1
+    else:
+        record["cui_susceptible"] = 0
+
+    pof = 2
+    rl_str = str(record.get("remaining_life") or "")
+    rl_m = re.search(r"(\d+(?:\.\d+)?)", rl_str)
+    if rl_m:
+        try:
+            rl = float(rl_m.group(1))
+            if rl <= 2.0: pof = 5
+            elif rl <= 5.0: pof = 4
+            elif rl <= 10.0: pof = 3
+        except ValueError:
+            pass
+
+    if record["cui_susceptible"]:
+        pof = min(5, pof + 1)
+
+    cof = 2
+    sheet = (record.get("source_sheet") or "").lower()
+    fluid = str(record.get("fluid_service") or "").lower()
+    name = (record.get("name") or "").lower()
+
+    if any(k in sheet or k in fluid or k in name for k in ["h2s", "acid", "lethal", "flare", "turbines", "vessels & tks", "gp inlet"]):
+        cof = 5
+    elif any(k in sheet or k in fluid or k in name for k in ["gas", "condensate", "fuel", "high press", "op piping", "gp piping", "epf"]):
+        cof = 4
+    elif any(k in sheet or k in fluid or k in name for k in ["crude", "oil", "coolers", "mfds", "tl", "fl"]):
+        cof = 3
+    elif any(k in sheet or k in fluid or k in name for k in ["water", "drain", "utility", "air"]):
+        cof = 1
+
+    record["pof_score"] = pof
+    record["cof_score"] = cof
+
+    score = pof * cof
+    if score >= 16 or (cof == 5 and pof >= 3) or (pof == 5 and cof >= 3):
+        record["risk_category"] = "HIGH"
+    elif score >= 8:
+        record["risk_category"] = "MEDIUM"
+    else:
+        record["risk_category"] = "LOW"
+
+
+def save_record(cur, record, extra_dict, clean_wipe):
+    evaluate_cui_and_risk(record)
+    record["extra_json"] = json.dumps(extra_dict, ensure_ascii=False) if extra_dict else "{}"
+
+    if not clean_wipe:
+        existing = None
+        if record.get("tag"):
+            existing = cur.execute("SELECT id, deferral_status, deferral_reason, deferral_expiry, deferral_approver, deferral_moc_no FROM assets WHERE source_sheet = ? AND tag = ?", (record["source_sheet"], record["tag"])).fetchone()
+        elif record.get("asset_number"):
+            existing = cur.execute("SELECT id, deferral_status, deferral_reason, deferral_expiry, deferral_approver, deferral_moc_no FROM assets WHERE source_sheet = ? AND asset_number = ?", (record["source_sheet"], record["asset_number"])).fetchone()
+
+        if existing:
+            aid = existing[0]
+            if existing[1]: record["deferral_status"] = existing[1]
+            if existing[2]: record["deferral_reason"] = existing[2]
+            if existing[3]: record["deferral_expiry"] = existing[3]
+            if existing[4]: record["deferral_approver"] = existing[4]
+            if existing[5]: record["deferral_moc_no"] = existing[5]
+            
+            update_cols = [k for k in record.keys() if k != "id"]
+            set_clause = ", ".join([f"{k} = ?" for k in update_cols])
+            vals = [record[k] for k in update_cols] + [aid]
+            cur.execute(f"UPDATE assets SET {set_clause} WHERE id = ?", vals)
+            return
+    
+    cols = list(record.keys())
+    placeholders = ", ".join(["?"] * len(cols))
+    cur.execute(f"INSERT INTO assets ({', '.join(cols)}) VALUES ({placeholders})", [record[k] for k in cols])
+
+
+# ---------------------------------------------------------------- Precision Sheet Parsers
+
+def parse_vessels_and_tks(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 7
+    for r in range(8, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        name = clean_str(ws.cell(r, 7).value)
+        tag = clean_str(ws.cell(r, 8).value)
+        if not sn and not name and not tag:
+            continue
+        
+        d_osi_last, _ = parse_date(ws.cell(r, 14).value)
+        d_osi_next, _ = parse_date(ws.cell(r, 15).value)
+        d_int_last, _ = parse_date(ws.cell(r, 16).value)
+        d_int_next, _ = parse_date(ws.cell(r, 17).value)
+
+        extra = gather_extra(ws, r, hdr_r, 24)
+        if ws.cell(r, 21).value:
+            extra["RBI Due Date (Internal)"] = str(ws.cell(r, 21).value)
+        if ws.cell(r, 22).value:
+            extra["RBI Due Date (OSI)"] = str(ws.cell(r, 22).value)
+
+        record = {
+            "source_sheet": "Vessels & TKs",
+            "sn": sn, "field": clean_str(ws.cell(r, 3).value),
+            "plant": clean_str(ws.cell(r, 4).value), "location": clean_str(ws.cell(r, 5).value),
+            "unit_name": clean_str(ws.cell(r, 6).value), "name": name or tag,
+            "tag": tag, "asset_number": clean_str(ws.cell(r, 9).value),
+            "description": clean_str(ws.cell(r, 10).value),
+            "in_service": clean_str(ws.cell(r, 11).value),
+            "insulation": clean_str(ws.cell(r, 12).value),
+            "last_insp_category": clean_str(ws.cell(r, 13).value),
+            "date_osi_last": d_osi_last, "date_osi_next": d_osi_next,
+            "date_internal_last": d_int_last, "date_internal_next": d_int_next,
+            "next_insp_category": clean_str(ws.cell(r, 18).value),
+            "corrosion_rate": clean_str(ws.cell(r, 19).value),
+            "remaining_life": clean_str(ws.cell(r, 20).value),
+            "remarks": clean_str(ws.cell(r, 23).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_coolers(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 6
+    for r in range(7, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        name = clean_str(ws.cell(r, 3).value)
+        tag = clean_str(ws.cell(r, 5).value)
+        if not sn and not name and not tag:
+            continue
+
+        extra = gather_extra(ws, r, hdr_r, 20)
+        record = {
+            "source_sheet": "Coolers",
+            "sn": sn, "name": name or tag, "tag": tag,
+            "plant": "Turbines / Gas Plant", "location": "Cooler Bay",
+            "material_spec": clean_str(ws.cell(r, 6).value),
+            "nominal_thickness": clean_str(ws.cell(r, 8).value),
+            "operating_temp": f"{clean_str(ws.cell(r, 18).value) or ''} / {clean_str(ws.cell(r, 19).value) or ''}".strip(" /"),
+            "operating_pressure": clean_str(ws.cell(r, 16).value),
+            "fluid_service": clean_str(ws.cell(r, 15).value),
+            "remarks": clean_str(ws.cell(r, 24).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_op_piping(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 5
+    for r in range(6, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        name = clean_str(ws.cell(r, 3).value)
+        if not sn and not name:
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 7).value)
+        d_next, _ = parse_date(ws.cell(r, 8).value)
+
+        extra = gather_extra(ws, r, hdr_r, 9)
+        rem_parts = [clean_str(ws.cell(r, 10).value), clean_str(ws.cell(r, 11).value), clean_str(ws.cell(r, 12).value)]
+        rem_str = "\n".join([p for p in rem_parts if p])
+
+        record = {
+            "source_sheet": "OP Piping",
+            "sn": sn, "name": name, "plant": "Oil Processing (OP)",
+            "operating_pressure": clean_str(ws.cell(r, 4).value),
+            "design_pressure": clean_str(ws.cell(r, 6).value),
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "remarks": rem_str,
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_gp_piping(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 8
+    current_pack = "PACK 01"
+
+    for r in range(9, ws.max_row + 1):
+        c2 = clean_str(ws.cell(r, 2).value)
+        c3 = clean_str(ws.cell(r, 3).value)
+        if c2 and "PACK" in c2.upper():
+            current_pack = c2
+            continue
+        if not c2 and not c3:
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 9).value)
+        d_next, _ = parse_date(ws.cell(r, 10).value)
+
+        pack_val = clean_str(ws.cell(r, 4).value) or current_pack
+        extra = gather_extra(ws, r, hdr_r, 13)
+
+        record = {
+            "source_sheet": "GP Piping",
+            "sn": c2, "name": c3 or f"{pack_val} Line", "field": pack_val,
+            "plant": "Gas Plant (GP)", "operating_pressure": clean_str(ws.cell(r, 5).value),
+            "design_pressure": clean_str(ws.cell(r, 7).value),
+            "insulation": clean_str(ws.cell(r, 8).value),
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "corrosion_rate": clean_str(ws.cell(r, 11).value),
+            "remarks": clean_str(ws.cell(r, 12).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_turbines_piping(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 5
+    for r in range(6, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        name = clean_str(ws.cell(r, 3).value)
+        if not sn and not name:
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 8).value)
+        d_next, _ = parse_date(ws.cell(r, 9).value)
+
+        extra = gather_extra(ws, r, hdr_r, 13)
+        record = {
+            "source_sheet": "Turbines Piping",
+            "sn": sn, "name": name, "field": clean_str(ws.cell(r, 4).value),
+            "plant": "Turbines", "operating_pressure": clean_str(ws.cell(r, 5).value),
+            "design_pressure": clean_str(ws.cell(r, 7).value),
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "corrosion_rate": clean_str(ws.cell(r, 10).value),
+            "remarks": clean_str(ws.cell(r, 11).value),
+            "insulation": clean_str(ws.cell(r, 12).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_op_dead_legs(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 3
+    for r in range(4, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        name = clean_str(ws.cell(r, 3).value)
+        if not sn and not name:
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 7).value)
+        d_next, _ = parse_date(ws.cell(r, 8).value)
+
+        extra = gather_extra(ws, r, hdr_r, 9)
+        record = {
+            "source_sheet": "OP Dead Legs",
+            "sn": sn, "name": name, "plant": "Oil Processing (OP)",
+            "location": "Dead Leg", "date_osi_last": d_last, "date_osi_next": d_next,
+            "remarks": clean_str(ws.cell(r, 12).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_gp_dead_legs(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 6
+    for r in range(7, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 3).value) or clean_str(ws.cell(r, 2).value)
+        vessel = clean_str(ws.cell(r, 4).value)
+        desc = clean_str(ws.cell(r, 5).value)
+        if not sn and not desc:
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 7).value)
+        d_next, _ = parse_date(ws.cell(r, 8).value)
+
+        extra = gather_extra(ws, r, hdr_r, 9)
+        name_str = f"{vessel} - {desc}" if vessel and desc else (desc or vessel or f"GP Dead Leg {sn}")
+        record = {
+            "source_sheet": "GP Dead Legs",
+            "sn": sn, "name": name_str, "plant": "Gas Plant (GP)",
+            "location": clean_str(ws.cell(r, 6).value) or "Dead Leg",
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "design_pressure": clean_str(ws.cell(r, 13).value),
+            "remarks": clean_str(ws.cell(r, 10).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_wd33_piping(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 5
+    for r in range(6, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        name = clean_str(ws.cell(r, 3).value)
+        if not sn and not name:
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 9).value)
+        d_next, _ = parse_date(ws.cell(r, 10).value)
+
+        extra = gather_extra(ws, r, hdr_r, 11)
+        record = {
+            "source_sheet": "WD-33 Piping",
+            "sn": sn, "name": name, "in_service": clean_str(ws.cell(r, 4).value),
+            "location": clean_str(ws.cell(r, 5).value) or "WD-33",
+            "field": clean_str(ws.cell(r, 6).value),
+            "operating_pressure": clean_str(ws.cell(r, 7).value),
+            "design_pressure": clean_str(ws.cell(r, 8).value),
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "remarks": clean_str(ws.cell(r, 11).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_epfs(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 4
+    for r in range(5, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        name = clean_str(ws.cell(r, 3).value)
+        if not sn and not name:
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 7).value)
+        d_next, _ = parse_date(ws.cell(r, 8).value)
+
+        extra = gather_extra(ws, r, hdr_r, 10)
+        record = {
+            "source_sheet": "EPFs",
+            "sn": sn, "name": name, "in_service": clean_str(ws.cell(r, 4).value),
+            "operating_pressure": clean_str(ws.cell(r, 5).value),
+            "design_pressure": clean_str(ws.cell(r, 6).value),
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "remarks": clean_str(ws.cell(r, 9).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_gp_inlet_lines(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    for r in range(1, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        desc = clean_str(ws.cell(r, 3).value)
+        if not sn or not sn.isdigit():
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 6).value)
+        d_next, _ = parse_date(ws.cell(r, 7).value)
+
+        rem_parts = [clean_str(ws.cell(r, 8).value), clean_str(ws.cell(r, 10).value), clean_str(ws.cell(r, 12).value)]
+        rem_str = "\n".join([p for p in rem_parts if p])
+
+        record = {
+            "source_sheet": "GP Inlet Lines",
+            "sn": sn, "name": desc or f"GP Inlet Line {sn}", "plant": "Gas Plant (GP)",
+            "nominal_thickness": clean_str(ws.cell(r, 4).value),
+            "operating_pressure": clean_str(ws.cell(r, 5).value),
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "remarks": rem_str,
+        }
+        save_record(cur, record, {}, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_mfds(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 5
+    for r in range(6, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        name = clean_str(ws.cell(r, 3).value)
+        if not sn and not name:
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 8).value)
+        d_next, _ = parse_date(ws.cell(r, 9).value)
+
+        extra = gather_extra(ws, r, hdr_r, 10)
+        record = {
+            "source_sheet": "MFDs",
+            "sn": sn, "name": name, "field": clean_str(ws.cell(r, 4).value),
+            "fluid_service": clean_str(ws.cell(r, 5).value),
+            "operating_pressure": clean_str(ws.cell(r, 7).value) or clean_str(ws.cell(r, 6).value),
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "remarks": clean_str(ws.cell(r, 11).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_tls(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 6
+    for r in range(7, ws.max_row + 1):
+        loc = clean_str(ws.cell(r, 2).value)
+        name = clean_str(ws.cell(r, 4).value)
+        if not name and not loc:
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 20).value)
+        d_next, _ = parse_date(ws.cell(r, 21).value)
+
+        extra = gather_extra(ws, r, hdr_r, 22)
+        record = {
+            "source_sheet": "TLs",
+            "name": name or f"Trunkline {loc}", "location": loc,
+            "in_service": clean_str(ws.cell(r, 5).value),
+            "operating_pressure": clean_str(ws.cell(r, 6).value),
+            "design_pressure": clean_str(ws.cell(r, 7).value),
+            "fluid_service": clean_str(ws.cell(r, 8).value),
+            "nominal_thickness": f'{clean_str(ws.cell(r, 9).value) or ""} (Sch {clean_str(ws.cell(r, 10).value) or ""})'.strip(),
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "remarks": clean_str(ws.cell(r, 24).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_fls(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 3
+    for r in range(4, ws.max_row + 1):
+        well = clean_str(ws.cell(r, 1).value)
+        if not well or "updated" in well.lower():
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 9).value)
+        d_next, _ = parse_date(ws.cell(r, 10).value)
+
+        extra = gather_extra(ws, r, hdr_r, 11)
+        record = {
+            "source_sheet": "FLs",
+            "name": f"Flowline {well}", "tag": well, "in_service": clean_str(ws.cell(r, 2).value),
+            "fluid_service": clean_str(ws.cell(r, 3).value),
+            "operating_pressure": clean_str(ws.cell(r, 5).value),
+            "design_pressure": clean_str(ws.cell(r, 6).value),
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "remarks": clean_str(ws.cell(r, 13).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def parse_gl_lines(conn, ws, clean_wipe):
+    cur = conn.cursor()
+    count = 0
+    hdr_r = 17
+    for r in range(18, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        well = clean_str(ws.cell(r, 3).value)
+        if not well or not sn:
+            continue
+
+        d_last, _ = parse_date(ws.cell(r, 13).value)
+        d_next, _ = parse_date(ws.cell(r, 14).value)
+
+        extra = gather_extra(ws, r, hdr_r, 15)
+        record = {
+            "source_sheet": "GL Lines",
+            "sn": sn, "name": f"Gas Lift Line {well}", "tag": well,
+            "fluid_service": "Gas Lift", "nominal_thickness": clean_str(ws.cell(r, 4).value),
+            "operating_pressure": clean_str(ws.cell(r, 5).value),
+            "operating_temp": clean_str(ws.cell(r, 7).value),
+            "t_min": clean_str(ws.cell(r, 11).value),
+            "date_osi_last": d_last, "date_osi_next": d_next,
+            "remaining_life": clean_str(ws.cell(r, 15).value),
+            "remarks": clean_str(ws.cell(r, 12).value),
+        }
+        save_record(cur, record, extra, clean_wipe)
+        count += 1
+    return count
+
+
+def import_temp_repairs(conn, ws):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM temp_repairs")
+    count = 0
+    for r in range(9, ws.max_row + 1):
+        facility = clean_str(ws.cell(r, 2).value)
+        asset_name = clean_str(ws.cell(r, 3).value)
+        section = clean_str(ws.cell(r, 4).value)
+        repaired_by = clean_str(ws.cell(r, 5).value)
+        
+        d_orig, _ = parse_date(ws.cell(r, 6).value)
+        life_yrs = clean_str(ws.cell(r, 7).value)
+        d_exp, _ = parse_date(ws.cell(r, 8).value)
+        hardness = clean_str(ws.cell(r, 9).value)
+        d_reval, _ = parse_date(ws.cell(r, 10).value)
+        d_last_exp, _ = parse_date(ws.cell(r, 11).value)
+        status = clean_str(ws.cell(r, 12).value) or "Active"
+        report_ref = clean_str(ws.cell(r, 13).value)
+        remarks = clean_str(ws.cell(r, 14).value)
+
+        if not any([facility, asset_name, section]):
+            continue
+
+        cur.execute("""
+            INSERT INTO temp_repairs (
+                facility_type, area, asset_name, repaired_section, repaired_by,
+                original_repair_date, repair_life_years, expiration_date,
+                hardness_hb, revalidation_date, last_expire_date, expiration_status,
+                report_ref, remarks
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (facility, facility, asset_name, section, repaired_by, d_orig, life_yrs,
+              d_exp, hardness, d_reval, d_last_exp, status, report_ref, remarks))
+        count += 1
+    return count
+
+
+def import_critical_assets(conn, ws):
+    cur = conn.cursor()
+    cur.execute("DELETE FROM critical_assets")
+    count = 0
+    current_category = "Critical Replacement Scope"
+
+    for r in range(7, ws.max_row + 1):
+        sn = clean_str(ws.cell(r, 2).value)
+        pack_no = clean_str(ws.cell(r, 3).value)
+        report_no = clean_str(ws.cell(r, 4).value)
+        item_desc = clean_str(ws.cell(r, 5).value)
+        
+        # Section header detection
+        if sn and not item_desc and not report_no:
+            current_category = sn
+            continue
+
+        if not item_desc:
+            continue
+
+        d_insp, _ = parse_date(ws.cell(r, 6).value)
+        scope = clean_str(ws.cell(r, 7).value)
+        done = clean_str(ws.cell(r, 8).value) or "No"
+        remarks = clean_str(ws.cell(r, 9).value)
+        plant_rem = clean_str(ws.cell(r, 10).value)
+
+        cur.execute("""
+            INSERT INTO critical_assets (
+                sn, category_section, pack_no, report_no, item_description,
+                insp_date, replacement_scope, replacement_done, remarks, plant_remarks
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (sn, current_category, pack_no, report_no, item_desc, d_insp, scope, done, remarks, plant_rem))
+        count += 1
+    return count
 
 
 SCHEMA = """
@@ -297,228 +850,28 @@ CREATE TABLE IF NOT EXISTS raw_rows (
 """
 
 
-def evaluate_cui_and_risk(record):
-    """Auto-computes CUI susceptibility and API 580 POF/COF at ingestion time."""
-    insul = str(record.get("insulation") or "").strip().lower()
-    has_insul = insul not in ("", "none", "no", "n/a", "0", "false")
-    
-    op_temp_str = str(record.get("operating_temp") or "")
-    op_temp_val = None
-    m = re.search(r"(-?\d+(?:\.\d+)?)", op_temp_str)
-    if m:
-        try:
-            op_temp_val = float(m.group(1))
-        except ValueError:
-            pass
-
-    if has_insul and op_temp_val is not None:
-        record["cui_susceptible"] = 1 if 10.0 <= op_temp_val <= 175.0 else 0
-    elif has_insul:
-        record["cui_susceptible"] = 1
-    else:
-        record["cui_susceptible"] = 0
-
-    pof = 2
-    rl_str = str(record.get("remaining_life") or "")
-    rl_m = re.search(r"(\d+(?:\.\d+)?)", rl_str)
-    if rl_m:
-        try:
-            rl = float(rl_m.group(1))
-            if rl <= 2.0: pof = 5
-            elif rl <= 5.0: pof = 4
-            elif rl <= 10.0: pof = 3
-        except ValueError:
-            pass
-
-    if record["cui_susceptible"]:
-        pof = min(5, pof + 1)
-
-    cof = 2
-    sheet = (record.get("source_sheet") or "").lower()
-    fluid = str(record.get("fluid_service") or "").lower()
-    name = (record.get("name") or "").lower()
-
-    if any(k in sheet or k in fluid or k in name for k in ["h2s", "acid", "lethal", "flare", "turbines", "vessels & tks", "gp inlet"]):
-        cof = 5
-    elif any(k in sheet or k in fluid or k in name for k in ["gas", "condensate", "fuel", "high press", "op piping", "gp piping", "epf"]):
-        cof = 4
-    elif any(k in sheet or k in fluid or k in name for k in ["crude", "oil", "coolers", "mfds", "tl", "fl"]):
-        cof = 3
-    elif any(k in sheet or k in fluid or k in name for k in ["water", "drain", "utility", "air"]):
-        cof = 1
-
-    record["pof_score"] = pof
-    record["cof_score"] = cof
-
-    score = pof * cof
-    if score >= 16 or (cof == 5 and pof >= 3) or (pof == 5 and cof >= 3):
-        record["risk_category"] = "HIGH"
-    elif score >= 8:
-        record["risk_category"] = "MEDIUM"
-    else:
-        record["risk_category"] = "LOW"
-
-
-def import_smart_sheet(conn, ws, sheet_name, clean_wipe=False):
-    """Smart sheet ingestion with header auto-discovery and synonym mapping."""
-    hdr_row, col_map = find_header_row_and_map(ws)
-    if not col_map:
-        return 0
-
-    cur = conn.cursor()
-    count = 0
-
-    for r in range(hdr_row + 1, ws.max_row + 1):
-        row_vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
-        if not any(row_vals):
-            continue
-
-        raw_dict = {}
-        for c in range(1, ws.max_column + 1):
-            h = ws.cell(row=hdr_row, column=c).value or f"Col_{c}"
-            raw_dict[str(h).strip()] = ws.cell(row=r, column=c).value
-
-        record = {"source_sheet": sheet_name}
-        extra_json = {}
-
-        for c, val in enumerate(row_vals, start=1):
-            if c in col_map:
-                field_name, orig_hdr = col_map[c]
-                if "date" in field_name:
-                    d_iso, d_raw = parse_date(val)
-                    record[field_name] = d_iso
-                    if d_raw:
-                        extra_json[orig_hdr + " (raw)"] = d_raw
-                else:
-                    record[field_name] = clean_str(val)
-            else:
-                h_name = ws.cell(row=hdr_row, column=c).value
-                if h_name and val is not None:
-                    extra_json[str(h_name).strip()] = str(val).strip()
-
-        if not record.get("name"):
-            record["name"] = record.get("tag") or record.get("asset_number") or record.get("description") or f"{sheet_name} Item {r}"
-
-        if not record.get("tag") and record.get("sn"):
-            record["tag"] = record.get("sn")
-
-        evaluate_cui_and_risk(record)
-        record["extra_json"] = json.dumps(extra_json, ensure_ascii=False) if extra_json else "{}"
-
-        # If not clean_wipe, attempt non-destructive upsert
-        if not clean_wipe:
-            existing = None
-            if record.get("tag"):
-                existing = cur.execute("SELECT id, deferral_status, deferral_reason, deferral_expiry, deferral_approver, deferral_moc_no FROM assets WHERE source_sheet = ? AND tag = ?", (sheet_name, record["tag"])).fetchone()
-            elif record.get("asset_number"):
-                existing = cur.execute("SELECT id, deferral_status, deferral_reason, deferral_expiry, deferral_approver, deferral_moc_no FROM assets WHERE source_sheet = ? AND asset_number = ?", (sheet_name, record["asset_number"])).fetchone()
-
-            if existing:
-                aid = existing[0]
-                if existing[1]: record["deferral_status"] = existing[1]
-                if existing[2]: record["deferral_reason"] = existing[2]
-                if existing[3]: record["deferral_expiry"] = existing[3]
-                if existing[4]: record["deferral_approver"] = existing[4]
-                if existing[5]: record["deferral_moc_no"] = existing[5]
-                
-                update_cols = [k for k in record.keys() if k != "id"]
-                set_clause = ", ".join([f"{k} = ?" for k in update_cols])
-                vals = [record[k] for k in update_cols] + [aid]
-                cur.execute(f"UPDATE assets SET {set_clause} WHERE id = ?", vals)
-            else:
-                cols = list(record.keys())
-                placeholders = ", ".join(["?"] * len(cols))
-                cur.execute(f"INSERT INTO assets ({', '.join(cols)}) VALUES ({placeholders})", [record[k] for k in cols])
-        else:
-            cols = list(record.keys())
-            placeholders = ", ".join(["?"] * len(cols))
-            cur.execute(f"INSERT INTO assets ({', '.join(cols)}) VALUES ({placeholders})", [record[k] for k in cols])
-
-        try:
-            cur.execute("INSERT INTO raw_rows (sheet, row_num, data) VALUES (?,?,?)",
-                        (sheet_name, r, json.dumps(raw_dict, default=str)))
-        except Exception:
-            pass
-        count += 1
-
-    return count
-
-
-def import_temp_repairs(conn, ws):
-    """Specialized importer for Temp-Repair (clamps & composite wraps)."""
-    hdr_row, _ = find_header_row_and_map(ws)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM temp_repairs")
-    count = 0
-
-    for r in range(hdr_row + 1, ws.max_row + 1):
-        facility = clean_str(ws.cell(row=r, column=2).value)
-        area = clean_str(ws.cell(row=r, column=3).value)
-        asset_name = clean_str(ws.cell(row=r, column=4).value)
-        section = clean_str(ws.cell(row=r, column=5).value)
-        repaired_by = clean_str(ws.cell(row=r, column=6).value)
-        
-        d_orig, _ = parse_date(ws.cell(row=r, column=7).value)
-        life_yrs = clean_str(ws.cell(row=r, column=8).value)
-        d_exp, _ = parse_date(ws.cell(row=r, column=9).value)
-        hardness = clean_str(ws.cell(row=r, column=10).value)
-        d_reval, _ = parse_date(ws.cell(row=r, column=11).value)
-        d_last_exp, _ = parse_date(ws.cell(row=r, column=12).value)
-        status = clean_str(ws.cell(row=r, column=13).value) or "Active"
-        report_ref = clean_str(ws.cell(row=r, column=14).value)
-        remarks = clean_str(ws.cell(row=r, column=15).value)
-
-        if not any([facility, area, asset_name, section]):
-            continue
-
-        cur.execute("""
-            INSERT INTO temp_repairs (
-                facility_type, area, asset_name, repaired_section, repaired_by,
-                original_repair_date, repair_life_years, expiration_date,
-                hardness_hb, revalidation_date, last_expire_date, expiration_status,
-                report_ref, remarks
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (facility, area, asset_name, section, repaired_by, d_orig, life_yrs,
-              d_exp, hardness, d_reval, d_last_exp, status, report_ref, remarks))
-        count += 1
-    return count
-
-
-def import_critical_assets(conn, ws):
-    """Specialized importer for Critical Assets (Turnaround scope)."""
-    hdr_row, _ = find_header_row_and_map(ws)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM critical_assets")
-    count = 0
-
-    for r in range(hdr_row + 1, ws.max_row + 1):
-        sn = clean_str(ws.cell(row=r, column=1).value)
-        category = clean_str(ws.cell(row=r, column=2).value)
-        pack_no = clean_str(ws.cell(row=r, column=3).value)
-        report_no = clean_str(ws.cell(row=r, column=4).value)
-        item_desc = clean_str(ws.cell(row=r, column=5).value)
-        d_insp, _ = parse_date(ws.cell(row=r, column=6).value)
-        scope = clean_str(ws.cell(row=r, column=7).value)
-        done = clean_str(ws.cell(row=r, column=8).value) or "No"
-        remarks = clean_str(ws.cell(row=r, column=9).value)
-        plant_rem = clean_str(ws.cell(row=r, column=10).value)
-
-        if not any([pack_no, item_desc, scope]):
-            continue
-
-        cur.execute("""
-            INSERT INTO critical_assets (
-                sn, category_section, pack_no, report_no, item_description,
-                insp_date, replacement_scope, replacement_done, remarks, plant_remarks
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
-        """, (sn, category, pack_no, report_no, item_desc, d_insp, scope, done, remarks, plant_rem))
-        count += 1
-    return count
+PARSERS = {
+    "Vessels & TKs": parse_vessels_and_tks,
+    "Coolers": parse_coolers,
+    "OP Piping": parse_op_piping,
+    "GP Piping": parse_gp_piping,
+    "Turbines Piping": parse_turbines_piping,
+    "OP Dead Legs": parse_op_dead_legs,
+    "GP Dead Legs": parse_gp_dead_legs,
+    "WD-33 Piping": parse_wd33_piping,
+    "EPFs": parse_epfs,
+    "GP Inlet Lines ": parse_gp_inlet_lines,
+    "GP Inlet Lines": parse_gp_inlet_lines,
+    "MFDs": parse_mfds,
+    "TLs": parse_tls,
+    "FLs": parse_fls,
+    "GL Lines": parse_gl_lines,
+}
 
 
 def import_workbook(xlsx_path, db_path, clean_wipe=False):
     print(f"\n=======================================================")
-    print(f"  Smart Ingestion ({'CLEAN WIPE' if clean_wipe else 'SMART SYNC'}): {xlsx_path}")
+    print(f"  Precision Ingestion ({'CLEAN WIPE' if clean_wipe else 'SMART SYNC'}): {xlsx_path}")
     print(f"  Target SQLite DB: {db_path}")
     print(f"=======================================================\n")
 
@@ -560,8 +913,8 @@ def import_workbook(xlsx_path, db_path, clean_wipe=False):
                 count = import_critical_assets(conn, ws)
                 total_critical += count
                 print(f"  [+] {sheet_name:28s} -> {count:4d} turnaround critical scope items")
-            else:
-                count = import_smart_sheet(conn, ws, sheet_name, clean_wipe=clean_wipe)
+            elif sheet_name in PARSERS:
+                count = PARSERS[sheet_name](conn, ws, clean_wipe)
                 total_assets += count
                 print(f"  [+] {sheet_name:28s} -> {count:4d} assets mapped & synchronized")
 
@@ -569,7 +922,7 @@ def import_workbook(xlsx_path, db_path, clean_wipe=False):
     conn.close()
 
     print(f"\n-------------------------------------------------------")
-    print(f"  SMART INGESTION COMPLETE:")
+    print(f"  PRECISION INGESTION COMPLETE:")
     print(f"  Total Equipment Assets : {total_assets:,}")
     print(f"  Temporary Repairs      : {total_temp_repairs:,}")
     print(f"  Critical Turnaround    : {total_critical:,}")
