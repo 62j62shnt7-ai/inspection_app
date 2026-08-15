@@ -111,7 +111,7 @@ function switchView(view) {
   }
 }
 
-// ---------------------------------------------------------------- Dashboard View
+// ---------------------------------------------------------------- Dashboard & Asset Table
 function assetRowHtml(a, compact) {
   const tag = a.tag || a.sn || "";
   const loc = [a.plant, a.location].filter(Boolean).join(" · ") || "—";
@@ -120,15 +120,39 @@ function assetRowHtml(a, compact) {
     <input type="checkbox" class="row-checkbox" data-id="${a.id}" ${isSelected ? "checked" : ""}>
   </td>`;
 
+  if (compact) {
+    return `<tr data-id="${a.id}">
+      <td>
+        <div style="font-weight:600; color:#fff;">${esc(a.name || "(unnamed)")} ${riskBadge(a)}</div>
+        <div class="tag-mono">${esc(tag)}</div>
+      </td>
+      <td><span class="tag-mono">${esc(a.source_sheet || "")}</span></td>
+      <td>${statusPill(a)}</td>
+    </tr>`;
+  }
+
+  const lastInsp = a.date_osi_last || a.date_internal_last || "—";
+  const nextInsp = a.date_osi_next || a.date_internal_next || "—";
+  const press = a.operating_pressure ? `${esc(a.operating_pressure)} psi` : (a.design_pressure ? `${esc(a.design_pressure)} psi (des)` : "—");
+
   return `<tr data-id="${a.id}">
     ${checkTd}
     <td>
       <div style="font-weight:600; color:#fff;">${esc(a.name || "(unnamed)")} ${riskBadge(a)}</div>
       <div class="tag-mono">${esc(tag)}</div>
     </td>
-    <td><span class="tag-mono">${esc(a.source_sheet || "")}</span></td>
+    <td><span class="tag-mono" style="font-weight:600; color:var(--accent);">${esc(a.source_sheet || "")}</span></td>
     <td>${statusPill(a)}</td>
-    ${compact ? "" : `<td><span class="tag-mono" style="font-weight:600; color:#fff;">${esc(a.field || "—")}</span></td><td>${esc(loc)}</td>`}
+    <td><span class="tag-mono" style="font-weight:600; color:#fff;">${esc(a.field || "—")}</span></td>
+    <td>
+      <div style="font-size:12px; color:var(--text-muted);">Last: <b style="color:#fff;">${fmtDate(lastInsp)}</b></div>
+      <div style="font-size:12px; color:var(--accent);">Next: <b>${fmtDate(nextInsp)}</b></div>
+    </td>
+    <td>
+      <div style="font-size:12px; color:#fff;">${press}</div>
+      ${a.nominal_thickness ? `<div style="font-size:11px; color:var(--text-faint);">Thk: ${esc(a.nominal_thickness)} mm</div>` : ""}
+    </td>
+    <td><div style="max-width:240px; font-size:12px; color:var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${esc(a.remarks || loc)}</div></td>
   </tr>`;
 }
 
@@ -137,7 +161,7 @@ function tableHtml(rows, compact) {
     return `<table class="assets"><tbody><tr class="empty-row"><td>No records found.</td></tr></tbody></table>`;
   }
   const checkTh = compact ? "" : `<th style="width:36px; text-align:center;"><input type="checkbox" id="selectAllCheckbox"></th>`;
-  const extraHeads = compact ? "" : `<th>Pack # / Header</th><th>Plant & Location</th>`;
+  const extraHeads = compact ? "" : `<th>Pack # / Field</th><th>Inspection Timeline</th><th>Pressure / Thk</th><th>Remarks & Location</th>`;
   return `<table class="assets">
     <thead><tr>${checkTh}<th>Asset & Risk</th><th>Source Sheet</th><th>Status</th>${extraHeads}</tr></thead>
     <tbody>${rows.map(a => assetRowHtml(a, compact)).join("")}</tbody>
@@ -360,6 +384,7 @@ async function loadDashboard() {
     const bySheetEl = document.getElementById("bySheet");
     if (bySheetEl && d.sheets && d.by_sheet) {
       state.sheets = d.sheets;
+      state.by_sheet = d.by_sheet;
       bySheetEl.innerHTML = d.sheets.map(s => {
         const info = d.by_sheet[s] || {total:0, overdue:0};
         return `<span class="chip" onclick="filterBySheet('${esc(s)}')">
@@ -374,6 +399,8 @@ async function loadDashboard() {
           d.sheets.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
         sel.value = current;
       }
+      
+      renderSheetTabs(d.sheets, sel ? sel.value : "");
     }
 
   } catch (err) {
@@ -381,10 +408,41 @@ async function loadDashboard() {
   }
 }
 
+function renderSheetTabs(sheets, activeSheet) {
+  const bar = document.getElementById("sheetTabsBar");
+  if (!bar) return;
+  
+  const allCount = state.assets?.length || 0;
+  const isAllActive = !activeSheet;
+  
+  let html = `<button class="sheet-tab-btn ${isAllActive ? 'active' : ''}" onclick="selectSheetTab('')">
+    📑 All Sheets <span class="badge-num">${allCount ? allCount.toLocaleString() : '1,288'}</span>
+  </button>`;
+  
+  (sheets || state.sheets || []).forEach(s => {
+    const isActive = activeSheet === s;
+    const count = (state.by_sheet && state.by_sheet[s]) ? state.by_sheet[s].total : '';
+    html += `<button class="sheet-tab-btn ${isActive ? 'active' : ''}" onclick="selectSheetTab('${esc(s)}')">
+      📂 ${esc(s)} ${count ? `<span class="badge-num">${count}</span>` : ''}
+    </button>`;
+  });
+  
+  bar.innerHTML = html;
+}
+
+window.selectSheetTab = function(sheetName) {
+  const sel = document.getElementById("sheetFilter");
+  if (sel) sel.value = sheetName;
+  state.page = 1;
+  loadAssets();
+  renderSheetTabs(state.sheets, sheetName);
+};
+
 window.filterBySheet = function(sheetName) {
   const sel = document.getElementById("sheetFilter");
   if (sel) sel.value = sheetName;
   switchView("assets");
+  renderSheetTabs(state.sheets, sheetName);
 };
 
 window.filterByAging = function(bucket) {
@@ -487,6 +545,18 @@ async function loadAssets() {
     const rows = await api("/api/assets?" + params.toString());
     state.assets = rows;
     state.filteredAssets = rows;
+
+    if (!state.sheets || !state.sheets.length) {
+      api("/api/dashboard").then(d => {
+        if (d.sheets) {
+          state.sheets = d.sheets;
+          state.by_sheet = d.by_sheet;
+          renderSheetTabs(d.sheets, sheet);
+        }
+      }).catch(() => {});
+    } else {
+      renderSheetTabs(state.sheets, sheet);
+    }
 
     renderAssetsTable();
   } catch (err) {
