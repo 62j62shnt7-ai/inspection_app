@@ -26,6 +26,7 @@ from urllib.parse import urlparse, parse_qs
 DB_PATH = sys.argv[1] if len(sys.argv) > 1 else "inspection_plan.db"
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 8642
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+BACKUPS_DIR = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
 
 if not os.path.exists(DB_PATH):
     print(f"Database not found: {DB_PATH}")
@@ -778,10 +779,12 @@ def api_export_csv(params):
 
 def _backup_db():
     if os.path.exists(DB_PATH):
+        os.makedirs(BACKUPS_DIR, exist_ok=True)
         ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        backup = f"{DB_PATH}.bak.{ts}"
-        shutil.copy2(DB_PATH, backup)
-        return backup
+        backup_filename = f"inspection_plan_{ts}.db.bak"
+        backup_path = os.path.join(BACKUPS_DIR, backup_filename)
+        shutil.copy2(DB_PATH, backup_path)
+        return os.path.join("backups", backup_filename)
     return None
 
 
