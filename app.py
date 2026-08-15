@@ -848,6 +848,24 @@ def api_reimport(payload=None):
     return _do_reimport(xlsx_file, os.path.basename(xlsx_file), clean_wipe=clean_wipe)
 
 
+def api_reimport_file(payload):
+    import base64
+    filename = payload.get("filename") or "uploaded.xlsx"
+    clean_wipe = bool(payload.get("clean_wipe", False))
+    filedata = payload.get("filedata")
+    if not filedata:
+        raise ValueError("No file content uploaded.")
+
+    save_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    temp_path = os.path.join(save_dir, "temp_imported_plan.xlsx")
+
+    binary_data = base64.b64decode(filedata)
+    with open(temp_path, "wb") as f:
+        f.write(binary_data)
+
+    return _do_reimport(temp_path, filename, clean_wipe=clean_wipe)
+
+
 def api_sync_excel(payload=None):
     payload = payload or {}
     import sync_excel
