@@ -1264,27 +1264,7 @@ async function loadYearlyPlan() {
   }
 }
 
-// ---------------------------------------------------------------- Export & Re-import & Write-back Sync
-document.getElementById("btnSyncExcel")?.addEventListener("click", async () => {
-  const btn = document.getElementById("btnSyncExcel");
-  const origText = btn.innerHTML;
-  btn.disabled = true;
-  btn.innerHTML = `<span>⏳</span> Syncing to Excel…`;
-  try {
-    const res = await api("/api/sync_excel", { method: "POST" });
-    showToast(res.message || "Successfully synced back to master Excel workbook!", false);
-  } catch (err) {
-    showToast("Sync to Excel failed: " + err.message, true);
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = origText;
-  }
-});
-
-document.getElementById("btnExportXlsx")?.addEventListener("click", () => {
-  window.location.href = "/api/export.xlsx";
-});
-
+// ---------------------------------------------------------------- Export & Re-import
 document.getElementById("btnExport")?.addEventListener("click", () => {
   const sheet = document.getElementById("sheetFilter")?.value || "";
   const params = new URLSearchParams(sheet ? {sheet} : {});
