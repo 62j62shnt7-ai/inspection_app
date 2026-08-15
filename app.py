@@ -820,23 +820,41 @@ def api_reimport(payload=None):
     return _do_reimport(xlsx_file, os.path.basename(xlsx_file), clean_wipe=clean_wipe)
 
 
-def api_reimport_file(payload):
-    import base64
-    filename = payload.get("filename") or "uploaded.xlsx"
-    clean_wipe = bool(payload.get("clean_wipe", False))
-    filedata = payload.get("filedata")
-    if not filedata:
-        raise ValueError("No file content uploaded.")
+def api_sync_excel(payload=None):
+    payload = payload or {}
+    import sync_excel
+    xlsx_file = payload.get("xlsx_path") or "/Users/don/Desktop/1. Master Inspection Plan - Updated 4-6-2026.xlsx"
+    if not os.path.exists(xlsx_file):
+        cwd_files = [f for f in os.listdir(".") if f.endswith(".xlsx") and not f.startswith("~$")]
+        if cwd_files:
+            xlsx_file = os.path.abspath(cwd_files[0])
+        else:
+            raise FileNotFoundError(f"Excel master file not found: {xlsx_file}")
+    with CONN_LOCK:
+        res = sync_excel.sync_db_to_excel(DB_PATH, xlsx_file)
+    return res
 
-    save_dir = os.path.dirname(os.path.abspath(DB_PATH))
-    temp_path = os.path.join(save_dir, "temp_imported_plan.xlsx")
 
-    binary_data = base64.b64decode(filedata)
-    with open(temp_path, "wb") as f:
-        f.write(binary_data)
-
-    return _do_reimport(temp_path, filename, clean_wipe=clean_wipe)
-
+def api_export_xlsx():
+    import sync_excel
+    master_xlsx = "/Users/don/Desktop/1. Master Inspection Plan - Updated 4-6-2026.xlsx"
+    if not os.path.exists(master_xlsx):
+        cwd_files = [f for f in os.listdir(".") if f.endswith(".xlsx") and not f.startswith("~$")]
+        if cwd_files:
+            master_xlsx = os.path.abspath(cwd_files[0])
+        else:
+            raise FileNotFoundError("Master Excel file not found for export template.")
+    
+    temp_export = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "temp_export.xlsx")
+    with CONN_LOCK:
+        sync_excel.sync_db_to_excel(DB_PATH, master_xlsx, output_path=temp_export)
+    with open(temp_export, "rb") as f:
+        data = f.read()
+    try:
+        os.remove(temp_export)
+    except Exception:
+        pass
+    return data
 
 
 def api_delete_log(log_id):
@@ -964,6 +982,14 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/api/export.xlsx":
+                data = api_export_xlsx()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                self.send_header("Content-Disposition", 'attachment; filename="Master_Inspection_Plan_Updated.xlsx"')
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
             else:
                 safe = os.path.normpath(path.lstrip("/"))
                 if ".." not in safe:
@@ -990,6 +1016,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(api_calculate_remaining_life(payload))
             elif path == "/api/database/clear":
                 self._send_json(api_clear_database())
+            elif path == "/api/sync_excel":
+                self._send_json(api_sync_excel(payload))
             elif path == "/api/temp_repairs":
                 self._send_json(api_create_temp_repair(payload))
             elif path == "/api/critical_assets":
