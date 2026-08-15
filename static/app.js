@@ -1201,8 +1201,58 @@ document.getElementById("btnExport")?.addEventListener("click", () => {
   window.location.href = "/api/export.csv?" + params.toString();
 });
 
+window.closeAllModals = function() {
+  document.querySelectorAll(".modal-overlay").forEach(m => m.classList.remove("open"));
+  const inp = document.getElementById("inputClearConfirmation");
+  if (inp) inp.value = "";
+  const btn = document.getElementById("btnExecuteClear");
+  if (btn) btn.disabled = true;
+};
+
+// ---------------------------------------------------------------- Clear All Database Data
+const btnClearDb = document.getElementById("btnClearDatabase");
+const inputClearConfirm = document.getElementById("inputClearConfirmation");
+const btnExecuteClear = document.getElementById("btnExecuteClear");
+
+if (btnClearDb) {
+  btnClearDb.addEventListener("click", () => {
+    if (inputClearConfirm) inputClearConfirm.value = "";
+    if (btnExecuteClear) btnExecuteClear.disabled = true;
+    document.getElementById("clearDbModal")?.classList.add("open");
+  });
+}
+
+if (inputClearConfirm && btnExecuteClear) {
+  inputClearConfirm.addEventListener("input", () => {
+    btnExecuteClear.disabled = inputClearConfirm.value.trim().toUpperCase() !== "CLEAR";
+  });
+}
+
+if (btnExecuteClear) {
+  btnExecuteClear.addEventListener("click", async () => {
+    const origText = btnExecuteClear.innerHTML;
+    btnExecuteClear.disabled = true;
+    btnExecuteClear.innerHTML = `<span>⏳</span> Wiping Database…`;
+
+    try {
+      const res = await api("/api/database/clear", { method: "POST" });
+      showToast(res.message || "Database cleared cleanly!", false);
+      closeAllModals();
+      refreshCurrentView();
+    } catch (err) {
+      showToast("Failed to clear database: " + err.message, true);
+    } finally {
+      btnExecuteClear.disabled = false;
+      btnExecuteClear.innerHTML = origText;
+    }
+  });
+}
+
+// ---------------------------------------------------------------- Import Excel Modal & Workflow
+let selectedImportFile = null;
 const picker = document.getElementById("excelFilePicker");
 const btnReimport = document.getElementById("btnReimport");
+const btnConfirmImport = document.getElementById("btnConfirmImport");
 
 if (btnReimport && picker) {
   btnReimport.addEventListener("click", () => {
@@ -1210,16 +1260,28 @@ if (btnReimport && picker) {
     picker.click();
   });
 
-  picker.addEventListener("change", async () => {
+  picker.addEventListener("change", () => {
     const file = picker.files[0];
     if (!file) return;
+    selectedImportFile = file;
 
-    const msg = `Are you sure you want to re-import "${file.name}"?\n\nThis will refresh the SQLite database with the inspection sheets from this Excel file.`;
-    if (!confirm(msg)) return;
+    const fnEl = document.getElementById("importFileName");
+    if (fnEl) fnEl.textContent = file.name;
 
-    const origText = btnReimport.innerHTML;
-    btnReimport.disabled = true;
-    btnReimport.innerHTML = `<span>⏳</span> Importing…`;
+    document.getElementById("reimportModal")?.classList.add("open");
+  });
+}
+
+if (btnConfirmImport) {
+  btnConfirmImport.addEventListener("click", async () => {
+    if (!selectedImportFile) return;
+
+    const mode = document.querySelector('input[name="importMode"]:checked')?.value || "clean";
+    const cleanWipe = mode === "clean";
+
+    const origText = btnConfirmImport.innerHTML;
+    btnConfirmImport.disabled = true;
+    btnConfirmImport.innerHTML = `<span>⏳</span> Ingesting Workbook…`;
 
     try {
       const reader = new FileReader();
@@ -1229,30 +1291,37 @@ if (btnReimport && picker) {
           const res = await api("/api/reimport_file", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({filename: file.name, filedata: base64Data}),
+            body: JSON.stringify({
+              filename: selectedImportFile.name,
+              filedata: base64Data,
+              clean_wipe: cleanWipe
+            }),
           });
-          showToast(res.message || "Re-import successful!", false);
+          showToast(res.message || "Workbook imported successfully!", false);
+          closeAllModals();
+          selectedImportFile = null;
           refreshCurrentView();
         } catch (err) {
-          showToast("Re-import failed: " + err.message, true);
+          showToast("Import failed: " + err.message, true);
         } finally {
-          btnReimport.disabled = false;
-          btnReimport.innerHTML = origText;
+          btnConfirmImport.disabled = false;
+          btnConfirmImport.innerHTML = origText;
         }
       };
       reader.onerror = () => {
         showToast("Failed to read selected file.", true);
-        btnReimport.disabled = false;
-        btnReimport.innerHTML = origText;
+        btnConfirmImport.disabled = false;
+        btnConfirmImport.innerHTML = origText;
       };
-      reader.readAsDataURL(file);
+      reader.readAsDataURL(selectedImportFile);
     } catch (err) {
       showToast("Error preparing file upload: " + err.message, true);
-      btnReimport.disabled = false;
-      btnReimport.innerHTML = origText;
+      btnConfirmImport.disabled = false;
+      btnConfirmImport.innerHTML = origText;
     }
   });
 }
+
 
 // ---------------------------------------------------------------- Create New Asset
 document.getElementById("btnNewAsset")?.addEventListener("click", () => {

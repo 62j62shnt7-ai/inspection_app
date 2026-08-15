@@ -44,14 +44,17 @@
 
     <div class="topbar-actions">
       <input type="file" id="excelFilePicker" accept=".xlsx,.xls" style="display:none">
-      <button id="btnReimport" class="btn ghost" title="Upload and re-import Master Inspection Plan Excel workbook">
-        <span>🔄</span> Re-import Excel
+      <button id="btnReimport" class="btn ghost" title="Upload and import Master Inspection Plan Excel workbook">
+        <span>🔄</span> Import Excel
       </button>
       <button id="btnExport" class="btn ghost" title="Export current filtered view to CSV">
         <span>📥</span> Export CSV
       </button>
       <button id="btnNewAsset" class="btn primary" title="Add a new asset manually">
         <span>+</span> New Asset
+      </button>
+      <button id="btnClearDatabase" class="btn danger small" title="Clear all records from database with backup">
+        <span>🗑️</span> Clear All
       </button>
     </div>
   </header>
@@ -312,12 +315,77 @@
   </div>
 </div>
 
+<!-- RE-IMPORT WORKBOOK MODAL -->
+<div id="reimportModal" class="modal-overlay">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>🔄 Import Excel Workbook</h3>
+      <button class="modal-close" onclick="closeAllModals()">✕</button>
+    </div>
+    <div class="modal-body">
+      <p class="modal-subtext">Selected file: <b id="importFileName" style="color:var(--accent);">plan.xlsx</b></p>
+      
+      <div class="import-mode-options">
+        <label class="import-mode-card">
+          <input type="radio" name="importMode" value="clean" checked>
+          <div>
+            <div style="font-weight:700; color:#fff;">✨ Clean Fresh Import (Recommended)</div>
+            <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
+              Wipes existing records and cleanly populates the database from the Excel file. An automatic backup is created beforehand.
+            </div>
+          </div>
+        </label>
+
+        <label class="import-mode-card" style="margin-top:10px;">
+          <input type="radio" name="importMode" value="sync">
+          <div>
+            <div style="font-weight:700; color:#fff;">🔄 Smart Sync / Update</div>
+            <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">
+              Updates equipment specs and dates from Excel while preserving all manual inspection logs and MOC deferrals.
+            </div>
+          </div>
+        </label>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeAllModals()">Cancel</button>
+      <button class="btn primary" id="btnConfirmImport">🚀 Start Import</button>
+    </div>
+  </div>
+</div>
+
+<!-- CLEAR ALL DATABASE MODAL -->
+<div id="clearDbModal" class="modal-overlay">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3 style="color:var(--red);">⚠️ Confirm Clear All Data</h3>
+      <button class="modal-close" onclick="closeAllModals()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div style="background:var(--red-bg); border:1px solid var(--red-border); padding:14px; border-radius:var(--radius-sm); margin-bottom:16px;">
+        <b style="color:var(--red);">High Risk Action:</b> This will erase all equipment assets, inspection logs, temporary repairs, critical scope items, and deferrals from the database.
+      </div>
+      <p style="font-size:12.5px; color:var(--text-muted); margin-bottom:14px;">
+        An automatic timestamped backup (e.g. <code style="color:var(--accent);">inspection_plan.db.bak.YYYYMMDD</code>) will be created before wiping.
+      </p>
+      <div class="field">
+        <label>Type <b style="color:#fff;">CLEAR</b> to confirm:</label>
+        <input id="inputClearConfirmation" placeholder="Type CLEAR here..." autocomplete="off">
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn ghost" onclick="closeAllModals()">Cancel</button>
+      <button class="btn danger" id="btnExecuteClear" disabled>🗑️ Clear Everything</button>
+    </div>
+  </div>
+</div>
+
 <!-- BULK INSPECTION LOG MODAL -->
 <div id="bulkLogModal" class="modal-overlay">
   <div class="modal-card">
     <div class="modal-head">
       <h3>⚡ Bulk Log Inspection Activity</h3>
-      <button class="modal-close" onclick="closeBulkModals()">✕</button>
+      <button class="modal-close" onclick="closeAllModals()">✕</button>
     </div>
     <div class="modal-body">
       <p class="modal-subtext">Apply inspection record and update next due dates for <b id="bulkLogCountText">0</b> selected assets.</p>
@@ -365,7 +433,7 @@
       </div>
     </div>
     <div class="modal-actions">
-      <button class="btn ghost" onclick="closeBulkModals()">Cancel</button>
+      <button class="btn ghost" onclick="closeAllModals()">Cancel</button>
       <button class="btn primary" id="btnSubmitBulkLog">💾 Apply Bulk Inspection</button>
     </div>
   </div>
@@ -376,7 +444,7 @@
   <div class="modal-card">
     <div class="modal-head">
       <h3>🛡️ Bulk Inspection Deferral (MOC Concession)</h3>
-      <button class="modal-close" onclick="closeBulkModals()">✕</button>
+      <button class="modal-close" onclick="closeAllModals()">✕</button>
     </div>
     <div class="modal-body">
       <p class="modal-subtext">Apply formal engineering concession & risk mitigation for <b id="bulkDeferralCountText">0</b> selected assets.</p>
@@ -422,7 +490,7 @@
       </div>
     </div>
     <div class="modal-actions">
-      <button class="btn ghost" onclick="closeBulkModals()">Cancel</button>
+      <button class="btn ghost" onclick="closeAllModals()">Cancel</button>
       <button class="btn primary" id="btnSubmitBulkDeferral">🛡️ Save Bulk Deferral</button>
     </div>
   </div>

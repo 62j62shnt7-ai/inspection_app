@@ -1230,6 +1230,35 @@ table.assets tbody tr:hover td {
   gap: 10px;
 }
 
+.import-mode-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.import-mode-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  padding: 14px 16px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.import-mode-card:hover {
+  border-color: var(--accent);
+  background: var(--panel-hover);
+}
+
+.import-mode-card input[type=radio] {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+
 /* ==========================================================================
    TOAST NOTIFICATIONS
    ========================================================================== */

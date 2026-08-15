@@ -91,10 +91,7 @@ def today():
 
 def calculate_pof_cof(row_dict):
     """Calculate API 580 POF (1-5 / A-E) and COF (1-5) based on engineering parameters."""
-    # Probability of Failure (POF) 1 to 5:
     pof = 2
-    
-    # 1. Remaining life factor
     rl_str = str(row_dict.get("remaining_life") or "")
     rl_m = re.search(r"(\d+(?:\.\d+)?)", rl_str)
     if rl_m:
@@ -106,7 +103,6 @@ def calculate_pof_cof(row_dict):
         except ValueError:
             pass
 
-    # 2. Overdue factor
     nd = row_dict.get("next_due")
     if nd and nd < today():
         try:
@@ -117,11 +113,9 @@ def calculate_pof_cof(row_dict):
         except Exception:
             pass
 
-    # 3. CUI factor
     if row_dict.get("is_cui"):
         pof = min(5, pof + 1)
 
-    # Consequence of Failure (COF) 1 to 5:
     cof = 2
     sheet = (row_dict.get("source_sheet") or "").lower()
     fluid = str(row_dict.get("fluid_service") or "").lower()
@@ -136,9 +130,8 @@ def calculate_pof_cof(row_dict):
     elif any(k in sheet or k in fluid or k in name for k in ["water", "drain", "utility", "air"]):
         cof = 1
 
-    # Overall Risk Category mapping
     risk_score = pof * cof
-    if risk_score >= 16 or cof == 5 and pof >= 3 or pof == 5 and cof >= 3:
+    if risk_score >= 16 or (cof == 5 and pof >= 3) or (pof == 5 and cof >= 3):
         risk_cat = "HIGH"
     elif risk_score >= 8:
         risk_cat = "MEDIUM"
@@ -211,7 +204,6 @@ def row_to_dict(row):
     d["pof_score"] = d.get("pof_score") or pof
     d["cof_score"] = d.get("cof_score") or cof
     
-    # POF letter code (1=A, 2=B, 3=C, 4=D, 5=E)
     pof_letters = {1: "A", 2: "B", 3: "C", 4: "D", 5: "E"}
     d["pof_letter"] = pof_letters.get(d["pof_score"], "B")
     d["rbi_matrix_cell"] = f"{d['cof_score']}{d['pof_letter']}"
@@ -315,7 +307,6 @@ def api_dashboard():
     expired_repairs = [tr for tr in temp_repairs if (tr.get("expiration_status") or "").lower() == "expired" or (tr.get("expiration_date") and tr.get("expiration_date") < today())]
     pending_critical = [ca for ca in critical_assets if (ca.get("replacement_done") or "").lower() not in ("yes", "1", "true", "completed")]
 
-    # Overdue Aging Triage breakdown
     aging_counts = {
         "0_30": len([r for r in overdue if r.get("aging_bucket") == "0_30"]),
         "31_90": len([r for r in overdue if r.get("aging_bucket") == "31_90"]),
@@ -325,7 +316,6 @@ def api_dashboard():
         "unmanaged_overdue": len([r for r in overdue if not r.get("is_deferred")]),
     }
 
-    # 5x5 RBI Matrix distribution
     rbi_matrix = {}
     pof_letters = ["A", "B", "C", "D", "E"]
     for cof in range(1, 6):
@@ -395,7 +385,6 @@ def api_calculate_remaining_life(payload):
         t_min = float(payload.get("t_min") or 0)
         years = float(payload.get("years_between") or 0)
         
-        # Calculate years between dates if provided
         d_act = payload.get("d_act")
         d_prev = payload.get("d_prev")
         if (not years or years <= 0) and d_act and d_prev:
@@ -408,7 +397,7 @@ def api_calculate_remaining_life(payload):
             years = 1.0
 
         corrosion_loss = max(0.0, t_prev - t_act)
-        cr = round(corrosion_loss / years, 3) # mm/yr
+        cr = round(corrosion_loss / years, 3)
 
         if t_act <= t_min:
             rl = 0.0
@@ -417,7 +406,7 @@ def api_calculate_remaining_life(payload):
             rl = 99.0
             next_interval_yrs = 10.0 if payload.get("piping_class") != "Class 1" else 5.0
         else:
-            rl = round((t_act - t_min) / cr, 1) # years
+            rl = round((t_act - t_min) / cr, 1)
             max_limit = 5.0 if payload.get("piping_class") == "Class 1" else 10.0
             next_interval_yrs = round(min(rl / 2.0, max_limit), 1)
 
@@ -519,6 +508,27 @@ def api_bulk_deferral(payload):
         "success": True,
         "message": f"Successfully applied {status} deferral to {len(asset_ids)} assets.",
         "updated_count": len(asset_ids)
+    }
+
+
+def api_clear_database():
+    """Clear all records from the database with an automatic backup beforehand."""
+    backup = _backup_db()
+    with CONN_LOCK:
+        CONN.execute("DELETE FROM assets")
+        CONN.execute("DELETE FROM temp_repairs")
+        CONN.execute("DELETE FROM critical_assets")
+        CONN.execute("DELETE FROM inspection_log")
+        CONN.execute("DELETE FROM raw_rows")
+        try:
+            CONN.execute("DELETE FROM assets_fts")
+        except Exception:
+            pass
+        CONN.commit()
+    return {
+        "success": True,
+        "message": f"Database wiped clean (0 records remaining). Backup saved as: {os.path.basename(backup) if backup else 'N/A'}",
+        "backup_file": backup
     }
 
 
@@ -775,11 +785,11 @@ def _backup_db():
     return None
 
 
-def _do_reimport(xlsx_path, display_name):
+def _do_reimport(xlsx_path, display_name, clean_wipe=False):
     import import_excel
-    _backup_db()
+    backup = _backup_db()
     with CONN_LOCK:
-        import_excel.import_workbook(xlsx_path, DB_PATH)
+        import_excel.import_workbook(xlsx_path, DB_PATH, clean_wipe=clean_wipe)
         global CONN
         try:
             CONN.close()
@@ -789,15 +799,31 @@ def _do_reimport(xlsx_path, display_name):
         row_count = CONN.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
     return {
         "success": True,
-        "message": f"Successfully re-imported {row_count} assets from '{display_name}'.",
+        "message": f"Successfully {'cleanly imported' if clean_wipe else 'synchronized'} {row_count} assets from '{display_name}'.",
         "total_assets": row_count,
         "excel_file": display_name,
+        "clean_wipe": clean_wipe,
+        "backup_file": backup
     }
+
+
+def api_reimport(payload=None):
+    payload = payload or {}
+    xlsx_file = payload.get("xlsx_path") or "1. Master Inspection Plan - Updated 4-6-2026.xlsx"
+    clean_wipe = bool(payload.get("clean_wipe", False))
+    if not os.path.exists(xlsx_file):
+        cwd_files = [f for f in os.listdir(".") if f.endswith(".xlsx") and not f.startswith("~$")]
+        if cwd_files:
+            xlsx_file = cwd_files[0]
+        else:
+            raise FileNotFoundError(f"Excel file not found: {xlsx_file}")
+    return _do_reimport(xlsx_file, os.path.basename(xlsx_file), clean_wipe=clean_wipe)
 
 
 def api_reimport_file(payload):
     import base64
     filename = payload.get("filename") or "uploaded.xlsx"
+    clean_wipe = bool(payload.get("clean_wipe", False))
     filedata = payload.get("filedata")
     if not filedata:
         raise ValueError("No file content uploaded.")
@@ -809,7 +835,8 @@ def api_reimport_file(payload):
     with open(temp_path, "wb") as f:
         f.write(binary_data)
 
-    return _do_reimport(temp_path, filename)
+    return _do_reimport(temp_path, filename, clean_wipe=clean_wipe)
+
 
 
 def api_delete_log(log_id):
@@ -961,10 +988,14 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(api_bulk_deferral(payload))
             elif path == "/api/calc/remaining-life":
                 self._send_json(api_calculate_remaining_life(payload))
+            elif path == "/api/database/clear":
+                self._send_json(api_clear_database())
             elif path == "/api/temp_repairs":
                 self._send_json(api_create_temp_repair(payload))
             elif path == "/api/critical_assets":
                 self._send_json(api_create_critical_asset(payload))
+            elif path == "/api/reimport":
+                self._send_json(api_reimport(payload))
             elif path == "/api/reimport_file":
                 self._send_json(api_reimport_file(payload))
             elif path.endswith("/log") and path.startswith("/api/assets/"):

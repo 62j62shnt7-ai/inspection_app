@@ -7,7 +7,7 @@ Features:
 - Header Row Auto-Discovery (handles title/banner rows).
 - Smart Unit & Number Cleansing (temp, pressure, thickness, corrosion rate, remaining life).
 - Ingestion-Time CUI & API 580 POF/COF Risk Auto-Classification.
-- Non-Destructive Upsert Mode (preserves manual inspection logs and MOC deferrals).
+- Non-Destructive Upsert Mode OR Clean Wipe Mode.
 - Specialized Turnaround Critical Scope & Temporary Repair table importers.
 """
 import sys
@@ -359,7 +359,7 @@ def evaluate_cui_and_risk(record):
         record["risk_category"] = "LOW"
 
 
-def import_smart_sheet(conn, ws, sheet_name):
+def import_smart_sheet(conn, ws, sheet_name, clean_wipe=False):
     """Smart sheet ingestion with header auto-discovery and synonym mapping."""
     hdr_row, col_map = find_header_row_and_map(ws)
     if not col_map:
@@ -405,25 +405,30 @@ def import_smart_sheet(conn, ws, sheet_name):
         evaluate_cui_and_risk(record)
         record["extra_json"] = json.dumps(extra_json, ensure_ascii=False) if extra_json else "{}"
 
-        # Non-destructive upsert
-        existing = None
-        if record.get("tag"):
-            existing = cur.execute("SELECT id, deferral_status, deferral_reason, deferral_expiry, deferral_approver, deferral_moc_no FROM assets WHERE source_sheet = ? AND tag = ?", (sheet_name, record["tag"])).fetchone()
-        elif record.get("asset_number"):
-            existing = cur.execute("SELECT id, deferral_status, deferral_reason, deferral_expiry, deferral_approver, deferral_moc_no FROM assets WHERE source_sheet = ? AND asset_number = ?", (sheet_name, record["asset_number"])).fetchone()
+        # If not clean_wipe, attempt non-destructive upsert
+        if not clean_wipe:
+            existing = None
+            if record.get("tag"):
+                existing = cur.execute("SELECT id, deferral_status, deferral_reason, deferral_expiry, deferral_approver, deferral_moc_no FROM assets WHERE source_sheet = ? AND tag = ?", (sheet_name, record["tag"])).fetchone()
+            elif record.get("asset_number"):
+                existing = cur.execute("SELECT id, deferral_status, deferral_reason, deferral_expiry, deferral_approver, deferral_moc_no FROM assets WHERE source_sheet = ? AND asset_number = ?", (sheet_name, record["asset_number"])).fetchone()
 
-        if existing:
-            aid = existing[0]
-            if existing[1]: record["deferral_status"] = existing[1]
-            if existing[2]: record["deferral_reason"] = existing[2]
-            if existing[3]: record["deferral_expiry"] = existing[3]
-            if existing[4]: record["deferral_approver"] = existing[4]
-            if existing[5]: record["deferral_moc_no"] = existing[5]
-            
-            update_cols = [k for k in record.keys() if k != "id"]
-            set_clause = ", ".join([f"{k} = ?" for k in update_cols])
-            vals = [record[k] for k in update_cols] + [aid]
-            cur.execute(f"UPDATE assets SET {set_clause} WHERE id = ?", vals)
+            if existing:
+                aid = existing[0]
+                if existing[1]: record["deferral_status"] = existing[1]
+                if existing[2]: record["deferral_reason"] = existing[2]
+                if existing[3]: record["deferral_expiry"] = existing[3]
+                if existing[4]: record["deferral_approver"] = existing[4]
+                if existing[5]: record["deferral_moc_no"] = existing[5]
+                
+                update_cols = [k for k in record.keys() if k != "id"]
+                set_clause = ", ".join([f"{k} = ?" for k in update_cols])
+                vals = [record[k] for k in update_cols] + [aid]
+                cur.execute(f"UPDATE assets SET {set_clause} WHERE id = ?", vals)
+            else:
+                cols = list(record.keys())
+                placeholders = ", ".join(["?"] * len(cols))
+                cur.execute(f"INSERT INTO assets ({', '.join(cols)}) VALUES ({placeholders})", [record[k] for k in cols])
         else:
             cols = list(record.keys())
             placeholders = ", ".join(["?"] * len(cols))
@@ -511,9 +516,9 @@ def import_critical_assets(conn, ws):
     return count
 
 
-def import_workbook(xlsx_path, db_path):
+def import_workbook(xlsx_path, db_path, clean_wipe=False):
     print(f"\n=======================================================")
-    print(f"  Smart Ingestion: {xlsx_path}")
+    print(f"  Smart Ingestion ({'CLEAN WIPE' if clean_wipe else 'SMART SYNC'}): {xlsx_path}")
     print(f"  Target SQLite DB: {db_path}")
     print(f"=======================================================\n")
 
@@ -521,6 +526,19 @@ def import_workbook(xlsx_path, db_path):
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+
+    if clean_wipe:
+        print("  [*] Wiping existing database tables for clean import...")
+        conn.execute("DELETE FROM assets")
+        conn.execute("DELETE FROM temp_repairs")
+        conn.execute("DELETE FROM critical_assets")
+        conn.execute("DELETE FROM inspection_log")
+        conn.execute("DELETE FROM raw_rows")
+        try:
+            conn.execute("DELETE FROM assets_fts")
+        except Exception:
+            pass
+        conn.commit()
 
     total_assets = 0
     total_temp_repairs = 0
@@ -543,7 +561,7 @@ def import_workbook(xlsx_path, db_path):
                 total_critical += count
                 print(f"  [+] {sheet_name:28s} -> {count:4d} turnaround critical scope items")
             else:
-                count = import_smart_sheet(conn, ws, sheet_name)
+                count = import_smart_sheet(conn, ws, sheet_name, clean_wipe=clean_wipe)
                 total_assets += count
                 print(f"  [+] {sheet_name:28s} -> {count:4d} assets mapped & synchronized")
 
@@ -561,8 +579,10 @@ def import_workbook(xlsx_path, db_path):
 
 
 def main():
-    xlsx = sys.argv[1] if len(sys.argv) > 1 else "1. Master Inspection Plan - Updated 4-6-2026.xlsx"
-    db = sys.argv[2] if len(sys.argv) > 2 else "inspection_plan.db"
+    clean = "--clean" in sys.argv or "-c" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    xlsx = args[0] if len(args) > 0 else "1. Master Inspection Plan - Updated 4-6-2026.xlsx"
+    db = args[1] if len(args) > 1 else "inspection_plan.db"
     
     if not os.path.exists(xlsx):
         found = [f for f in os.listdir(".") if f.endswith(".xlsx") and not f.startswith("~$")]
@@ -572,7 +592,7 @@ def main():
             print(f"Error: Excel file not found: {xlsx}")
             sys.exit(1)
 
-    import_workbook(xlsx, db)
+    import_workbook(xlsx, db, clean_wipe=clean)
 
 
 if __name__ == "__main__":
