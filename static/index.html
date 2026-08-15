@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Master Inspection Plan</title>
+<meta name="description" content="Track equipment inspections, overdue items, and generate yearly inspection plans.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔧</text></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Roboto+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">MIP</span>
+      <span class="brand-name">Master Inspection Plan</span>
+    </div>
+    <nav class="tabs" id="tabs">
+      <button class="tab active" data-view="dashboard">Dashboard</button>
+      <button class="tab" data-view="assets">Assets Inventory</button>
+      <button class="tab" data-view="critical">Critical Replacements</button>
+      <button class="tab" data-view="temprepairs">Temporary Repairs</button>
+      <button class="tab" data-view="yearly">Yearly Plan</button>
+    </nav>
+    <div class="topbar-actions">
+      <input type="file" id="excelFilePicker" accept=".xlsx,.xls" style="display:none">
+      <button id="btnReimport" class="btn ghost">Re-import Excel</button>
+      <button id="btnExport" class="btn ghost">Export CSV</button>
+      <button id="btnNewAsset" class="btn primary">+ New Asset</button>
+    </div>
+  </header>
+
+  <main id="main">
+
+    <!-- DASHBOARD -->
+    <section id="view-dashboard" class="view active">
+      <div class="stat-row" id="statRow"></div>
+
+      <div class="panel-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>High Risk Equipment (API 580)</h2>
+            <span class="hint">Critical equipment requiring priority inspection & evaluation</span>
+          </div>
+          <div id="highRiskList" class="asset-table-wrap"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Overdue Inspections</h2>
+            <span class="hint">Next OSI or Internal due date already passed</span>
+          </div>
+          <div id="overdueList" class="asset-table-wrap"></div>
+        </div>
+      </div>
+
+      <div class="panel-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Temporary Repairs Expiration Alert</h2>
+            <span class="hint">Clamps & composite wraps approaching/past expiration</span>
+          </div>
+          <div id="tempRepairsWidgetList" class="asset-table-wrap"></div>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2>Pending Critical Replacements</h2>
+            <span class="hint">Corroded Sch 40 joints & nozzles scheduled for turnaround replacement</span>
+          </div>
+          <div id="criticalWidgetList" class="asset-table-wrap"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Asset Distribution by Source Sheet</h2>
+          <span class="hint">System & Equipment Class breakdown</span>
+        </div>
+        <div id="bySheet" class="chip-row"></div>
+      </div>
+    </section>
+
+    <!-- ASSETS -->
+    <section id="view-assets" class="view">
+      <div class="toolbar">
+        <input id="searchBox" type="text" placeholder="Search name, tag, asset #, fluid service, remarks…">
+        <select id="sheetFilter"><option value="">All sheets</option></select>
+        <select id="riskFilter">
+          <option value="">All Risk Levels</option>
+          <option value="HIGH">High Risk</option>
+          <option value="MEDIUM">Medium Risk</option>
+          <option value="LOW">Low Risk</option>
+        </select>
+        <select id="groupFilter">
+          <option value="">No Grouping</option>
+          <option value="field">Group by Pack #</option>
+          <option value="location">Group by Location</option>
+          <option value="plant">Group by Plant/Facility</option>
+          <option value="source_sheet">Group by Source Sheet</option>
+        </select>
+        <label class="checkbox"><input type="checkbox" id="overdueOnly"> Overdue only</label>
+      </div>
+      <div id="assetsTableWrap" class="asset-table-wrap full"></div>
+    </section>
+
+    <!-- CRITICAL REPLACEMENTS -->
+    <section id="view-critical" class="view">
+      <div class="toolbar">
+        <input id="criticalSearch" type="text" placeholder="Search critical replacement scope, pack #, report #…">
+        <select id="criticalDoneFilter">
+          <option value="">All Statuses</option>
+          <option value="No">Pending Replacement</option>
+          <option value="Yes">Completed Replacement</option>
+        </select>
+      </div>
+      <div id="criticalTableWrap" class="asset-table-wrap full"></div>
+    </section>
+
+    <!-- TEMPORARY REPAIRS -->
+    <section id="view-temprepairs" class="view">
+      <div class="toolbar">
+        <input id="tempRepairSearch" type="text" placeholder="Search area, asset, repaired section, contractor, report #…">
+        <select id="tempRepairStatusFilter">
+          <option value="">All Statuses</option>
+          <option value="Expired">Expired Repairs</option>
+          <option value="Valid">Valid / Active</option>
+          <option value="Replaced">Permanently Replaced</option>
+        </select>
+      </div>
+      <div id="tempRepairsTableWrap" class="asset-table-wrap full"></div>
+    </section>
+
+    <!-- YEARLY PLAN -->
+    <section id="view-yearly" class="view">
+      <div class="toolbar">
+        <label>Year</label>
+        <input id="yearInput" type="number" style="width:100px">
+        <button id="btnLoadYear" class="btn primary">Generate Plan</button>
+        <button id="btnPrintYear" class="btn ghost">Print</button>
+      </div>
+      <div id="yearlyMeta" class="hint" style="margin: 8px 0 16px;"></div>
+      <div id="yearlyTableWrap" class="asset-table-wrap full"></div>
+    </section>
+
+  </main>
+</div>
+
+<!-- Asset detail / edit drawer -->
+<div id="drawerOverlay" class="drawer-overlay">
+  <div id="drawer" class="drawer">
+    <div class="drawer-head">
+      <h2 id="drawerTitle">Asset</h2>
+      <button id="drawerClose" class="btn ghost small">Close</button>
+    </div>
+    <div id="drawerBody" class="drawer-body"></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
