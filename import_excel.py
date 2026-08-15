@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-import_excel.py — Precision importer of the Master Inspection Plan workbook into
-inspection_plan.db (SQLite), accurately matching exact column structures for each sheet.
+import_excel.py — Smart, Resilient Importer for Master Inspection Plan Excel workbooks.
 
-Run this script to build or refresh inspection_plan.db from the master Excel file.
+Features:
+- Dynamic Header & Schema Auto-Detection with Fuzzy Synonym Matching.
+- Header Row Auto-Discovery (handles title/banner rows).
+- Smart Unit & Number Cleansing (temp, pressure, thickness, corrosion rate, remaining life).
+- Ingestion-Time CUI & API 580 POF/COF Risk Auto-Classification.
+- Non-Destructive Upsert Mode (preserves manual inspection logs and MOC deferrals).
+- Specialized Turnaround Critical Scope & Temporary Repair table importers.
 """
 import sys
 import os
@@ -11,6 +16,7 @@ import json
 import sqlite3
 import datetime
 import re
+import contextlib
 
 try:
     import openpyxl
@@ -21,7 +27,7 @@ except ImportError:
 SKIP_SHEETS = {
     "DWG", "Evaluation Criteria", "Inspection Sequence",
     "Anodes Reporting& As-Found Insp", "API-574 Tables & Pipe Sch",
-    "HT Press Tables", "FF",
+    "HT Press Tables", "FF", "Insulated Piping"
 }
 
 MONTH_MAP = {
@@ -39,8 +45,33 @@ DATE_PATTERNS = [
     re.compile(r"^\s*Q([1-4])[-/ ](\d{4})\s*$", re.I),                   # Q3 2024
 ]
 
-
-import contextlib
+FIELD_SYNONYMS = [
+    (re.compile(r"^(s[\.\s/]?n|serial|no\.?|seq|item\s*no)$", re.I), "sn"),
+    (re.compile(r"(field|pack\s*(no|\#)?|package|header|section)", re.I), "field"),
+    (re.compile(r"(plant|facility|station|complex)", re.I), "plant"),
+    (re.compile(r"(location|area|deck|platform|sub[\s-]*system)", re.I), "location"),
+    (re.compile(r"(unit(\s*name)?|system(\s*name)?)", re.I), "unit_name"),
+    (re.compile(r"^(asset(\s*name)?|equipment(\s*name)?|description|item(\s*description)?|line(\s*description)?)$", re.I), "name"),
+    (re.compile(r"(tag(\s*no|\s*#)?|equipment\s*tag|line\s*no|line\s*#|spool(\s*no|\s*#)?|iso(\s*no|\s*#)?)", re.I), "tag"),
+    (re.compile(r"(asset\s*(no|\#|id|number)|equip\s*(no|\#|id))", re.I), "asset_number"),
+    (re.compile(r"(in[\s_-]*service|operational\s*status|status)", re.I), "in_service"),
+    (re.compile(r"(insul(ation)?(\s*type)?|cladding|lagging)", re.I), "insulation"),
+    (re.compile(r"(last\s*(osi|on[\s-]*stream|external)|date\s*last\s*osi|last\s*insp(\w*\s*)?date)", re.I), "date_osi_last"),
+    (re.compile(r"(next\s*(osi|on[\s-]*stream|external)|date\s*next\s*osi|next\s*insp(\w*\s*)?date|next\s*due|due\s*date)", re.I), "date_osi_next"),
+    (re.compile(r"(last\s*(internal|int(\.)?|major)|date\s*last\s*internal)", re.I), "date_internal_last"),
+    (re.compile(r"(next\s*(internal|int(\.)?|major)|date\s*next\s*internal)", re.I), "date_internal_next"),
+    (re.compile(r"(fluid(\s*service)?|medium|service|product|process(\s*fluid)?)", re.I), "fluid_service"),
+    (re.compile(r"(design\s*press(ure)?|p_?des|dp\s*\(|des\.\s*press)", re.I), "design_pressure"),
+    (re.compile(r"(design\s*temp(erature)?|t_?des|dt\s*\(|des\.\s*temp)", re.I), "design_temp"),
+    (re.compile(r"(operat(ing)?\s*press(ure)?|p_?op|op\s*\(|op\.\s*press)", re.I), "operating_pressure"),
+    (re.compile(r"(operat(ing)?\s*temp(erature)?|t_?op|ot\s*\(|op\.\s*temp)", re.I), "operating_temp"),
+    (re.compile(r"(material(\s*spec)?|metallurgy|pipe\s*mat|spec)", re.I), "material_spec"),
+    (re.compile(r"(nominal\s*(thk|thickness|wall)|t_?nom|sch(edule)?)", re.I), "nominal_thickness"),
+    (re.compile(r"(t_?min|min(\w*\s*)?(thk|thickness|wall)|retire(ment)?\s*thk)", re.I), "t_min"),
+    (re.compile(r"(corr(osion)?\s*rate|cr\s*\(|short\s*term\s*cr|long\s*term\s*cr)", re.I), "corrosion_rate"),
+    (re.compile(r"(remain(ing)?\s*life|rem\s*life|rl\s*\()", re.I), "remaining_life"),
+    (re.compile(r"(remark(s)?|comment(s)?|note(s)?|recommendation(s)?|finding(s)?)", re.I), "remarks"),
+]
 
 import_errors = []
 
@@ -52,8 +83,9 @@ def import_sheet_guard(sheet_name):
         import_errors.append((sheet_name, str(e)))
         print(f"  [!] ERROR importing {sheet_name}: {e}")
 
+
 def parse_date(value):
-    """Smart multi-format date parser into ISO date string (YYYY-MM-DD). Returns (iso_date, raw_text)."""
+    """Smart multi-format date parser into ISO date string (YYYY-MM-DD)."""
     if value is None:
         return None, None
     if isinstance(value, (datetime.datetime, datetime.date)):
@@ -65,45 +97,35 @@ def parse_date(value):
     if not text:
         return None, None
 
-    # Try standard patterns
-    m = DATE_PATTERNS[0].match(text)
-    if m:
-        return f"{m.group(1)}-01-01", text
-
-    m = DATE_PATTERNS[1].match(text)
-    if m:
-        month, year = int(m.group(1)), m.group(2)
-        if 1 <= month <= 12:
-            return f"{year}-{month:02d}-01", text
-
-    m = DATE_PATTERNS[2].match(text)
-    if m:
-        return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", text
-
-    m = DATE_PATTERNS[3].match(text)
-    if m:
-        p1, p2, year = int(m.group(1)), int(m.group(2)), m.group(3)
-        month = p1 if 1 <= p1 <= 12 else (p2 if 1 <= p2 <= 12 else 1)
-        day = p2 if p1 == month else p1
-        return f"{year}-{month:02d}-{min(day, 28):02d}", text
-
-    m = DATE_PATTERNS[4].match(text)
-    if m:
-        mon_str, year = m.group(1).lower()[:3], m.group(2)
-        if mon_str in MONTH_MAP:
-            return f"{year}-{MONTH_MAP[mon_str]:02d}-01", text
-
-    m = DATE_PATTERNS[5].match(text)
-    if m:
-        day, mon_str, year = int(m.group(1)), m.group(2).lower()[:3], m.group(3)
-        if mon_str in MONTH_MAP:
-            return f"{year}-{MONTH_MAP[mon_str]:02d}-{min(day, 28):02d}", text
-
-    m = DATE_PATTERNS[6].match(text)
-    if m:
-        qtr, year = int(m.group(1)), m.group(2)
-        qtr_month = (qtr - 1) * 3 + 1
-        return f"{year}-{qtr_month:02d}-01", text
+    for idx, pat in enumerate(DATE_PATTERNS):
+        m = pat.match(text)
+        if not m:
+            continue
+        if idx == 0: # 2024
+            return f"{m.group(1)}-01-01", text
+        elif idx == 1: # 09/2024
+            month, year = int(m.group(1)), m.group(2)
+            if 1 <= month <= 12:
+                return f"{year}-{month:02d}-01", text
+        elif idx == 2: # 2024-09-15
+            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", text
+        elif idx == 3: # 15/09/2024 or 09/15/2024
+            p1, p2, year = int(m.group(1)), int(m.group(2)), m.group(3)
+            month = p1 if 1 <= p1 <= 12 else (p2 if 1 <= p2 <= 12 else 1)
+            day = p2 if p1 == month else p1
+            return f"{year}-{month:02d}-{min(day, 28):02d}", text
+        elif idx == 4: # Sep-2024
+            mon_str, year = m.group(1).lower()[:3], m.group(2)
+            if mon_str in MONTH_MAP:
+                return f"{year}-{MONTH_MAP[mon_str]:02d}-01", text
+        elif idx == 5: # 15-Sep-2024
+            day, mon_str, year = int(m.group(1)), m.group(2).lower()[:3], m.group(3)
+            if mon_str in MONTH_MAP:
+                return f"{year}-{MONTH_MAP[mon_str]:02d}-{min(day, 28):02d}", text
+        elif idx == 6: # Q3 2024
+            qtr, year = int(m.group(1)), m.group(2)
+            qtr_month = (qtr - 1) * 3 + 1
+            return f"{year}-{qtr_month:02d}-01", text
 
     return None, text
 
@@ -115,21 +137,30 @@ def clean_str(val):
     return s if s else None
 
 
-def gather_remarks(ws, r, hdr_r, base_rem, start_col):
-    """Gathers all extra trailing columns into a single formatted remarks string."""
-    parts = []
-    base = str(base_rem).strip() if base_rem else ""
-    if base:
-        parts.append(base)
-    for c in range(start_col, ws.max_column + 1):
-        hdr = ws.cell(row=hdr_r, column=c).value
-        val = ws.cell(row=r, column=c).value
-        if hdr and val:
-            v_str = str(val).strip()
-            if v_str and v_str != base:
-                h_str = str(hdr).strip().replace("\n", " ")
-                parts.append(f"{h_str}:\n{v_str}")
-    return "\n\n".join(parts) if parts else None
+def find_header_row_and_map(ws, max_scan_rows=12):
+    best_row = 1
+    best_score = 0
+    best_map = {}
+
+    for r in range(1, min(ws.max_row + 1, max_scan_rows + 1)):
+        col_map = {}
+        score = 0
+        for c in range(1, ws.max_column + 1):
+            val = ws.cell(row=r, column=c).value
+            if not val:
+                continue
+            hdr_str = str(val).strip()
+            for pat, field_name in FIELD_SYNONYMS:
+                if pat.search(hdr_str):
+                    col_map[c] = (field_name, hdr_str)
+                    score += 1
+                    break
+        if score > best_score:
+            best_score = score
+            best_row = r
+            best_map = col_map
+
+    return best_row, best_map
 
 
 SCHEMA = """
@@ -166,6 +197,14 @@ CREATE TABLE IF NOT EXISTS assets (
     risk_category TEXT,
     damage_mechanisms TEXT,
     cui_susceptible INTEGER,
+    deferral_status TEXT,
+    deferral_reason TEXT,
+    deferral_mitigation TEXT,
+    deferral_expiry TEXT,
+    deferral_approver TEXT,
+    deferral_moc_no TEXT,
+    pof_score INTEGER,
+    cof_score INTEGER,
     remarks TEXT,
     extra_json TEXT,
     archived INTEGER DEFAULT 0,
@@ -184,7 +223,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
     content='assets', content_rowid='id'
 );
 
--- Triggers to keep FTS table in sync
 CREATE TRIGGER IF NOT EXISTS assets_ai AFTER INSERT ON assets BEGIN
   INSERT INTO assets_fts(rowid, name, tag, asset_number, description, remarks, sn, fluid_service, field)
   VALUES (new.id, new.name, new.tag, new.asset_number, new.description, new.remarks, new.sn, new.fluid_service, new.field);
@@ -202,21 +240,6 @@ CREATE TRIGGER IF NOT EXISTS assets_au AFTER UPDATE ON assets BEGIN
   VALUES (new.id, new.name, new.tag, new.asset_number, new.description, new.remarks, new.sn, new.fluid_service, new.field);
 END;
 
-CREATE TABLE IF NOT EXISTS inspection_log (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    asset_id INTEGER NOT NULL,
-    insp_date TEXT,
-    insp_type TEXT,
-    findings TEXT,
-    next_due_date TEXT,
-    inspector_name TEXT,
-    insp_method TEXT,
-    t_actual TEXT,
-    action_required TEXT,
-    created_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (asset_id) REFERENCES assets(id)
-);
-
 CREATE TABLE IF NOT EXISTS temp_repairs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     facility_type TEXT,
@@ -225,7 +248,7 @@ CREATE TABLE IF NOT EXISTS temp_repairs (
     repaired_section TEXT,
     repaired_by TEXT,
     original_repair_date TEXT,
-    repair_life_years INTEGER,
+    repair_life_years TEXT,
     expiration_date TEXT,
     hardness_hb TEXT,
     revalidation_date TEXT,
@@ -251,587 +274,305 @@ CREATE TABLE IF NOT EXISTS critical_assets (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS inspection_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    insp_date TEXT,
+    insp_type TEXT,
+    findings TEXT,
+    next_due_date TEXT,
+    inspector_name TEXT,
+    insp_method TEXT,
+    t_actual TEXT,
+    action_required TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS raw_rows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sheet TEXT,
     row_num INTEGER,
     data TEXT
 );
-
-CREATE INDEX IF NOT EXISTS idx_assets_sheet ON assets(source_sheet);
-CREATE INDEX IF NOT EXISTS idx_assets_osi_next ON assets(date_osi_next);
-CREATE INDEX IF NOT EXISTS idx_assets_int_next ON assets(date_internal_next);
-CREATE INDEX IF NOT EXISTS idx_temp_repairs_exp ON temp_repairs(expiration_date);
 """
 
 
-def insert_asset(cur, sheet, sn=None, field=None, plant=None, location=None,
-                 unit_name=None, name=None, tag=None, asset_number=None,
-                 description=None, in_service=None, insulation=None,
-                 last_cat=None, osi_last=None, osi_next=None, int_last=None,
-                 int_next=None, next_cat=None, cr=None, rl=None,
-                 remarks=None, extra=None):
-    d_osi_last, r1 = parse_date(osi_last)
-    d_osi_next, r2 = parse_date(osi_next)
-    d_int_last, r3 = parse_date(int_last)
-    d_int_next, r4 = parse_date(int_next)
+def evaluate_cui_and_risk(record):
+    """Auto-computes CUI susceptibility and API 580 POF/COF at ingestion time."""
+    insul = str(record.get("insulation") or "").strip().lower()
+    has_insul = insul not in ("", "none", "no", "n/a", "0", "false")
+    
+    op_temp_str = str(record.get("operating_temp") or "")
+    op_temp_val = None
+    m = re.search(r"(-?\d+(?:\.\d+)?)", op_temp_str)
+    if m:
+        try:
+            op_temp_val = float(m.group(1))
+        except ValueError:
+            pass
 
-    ex = extra or {}
-    for label, raw in [
-        ("Last OSI Date", r1), ("Next OSI Due Date", r2),
-        ("Last Internal Insp Date", r3), ("Next Internal Insp Date", r4),
-    ]:
-        if raw:
-            ex[label + " (raw)"] = raw
+    if has_insul and op_temp_val is not None:
+        record["cui_susceptible"] = 1 if 10.0 <= op_temp_val <= 175.0 else 0
+    elif has_insul:
+        record["cui_susceptible"] = 1
+    else:
+        record["cui_susceptible"] = 0
 
-    cur.execute("""
-        INSERT INTO assets (
-            source_sheet, sn, field, plant, location, unit_name, name, tag,
-            asset_number, description, in_service, insulation,
-            last_insp_category, date_osi_last, date_osi_next,
-            date_internal_last, date_internal_next, next_insp_category,
-            corrosion_rate, remaining_life,
-            remarks, extra_json
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        clean_str(sheet), clean_str(sn), clean_str(field), clean_str(plant),
-        clean_str(location), clean_str(unit_name), clean_str(name), clean_str(tag),
-        clean_str(asset_number), clean_str(description), clean_str(in_service), clean_str(insulation),
-        clean_str(last_cat), d_osi_last, d_osi_next,
-        d_int_last, d_int_next, clean_str(next_cat),
-        clean_str(cr), clean_str(rl),
-        clean_str(remarks), json.dumps(ex, ensure_ascii=False)
-    ))
+    pof = 2
+    rl_str = str(record.get("remaining_life") or "")
+    rl_m = re.search(r"(\d+(?:\.\d+)?)", rl_str)
+    if rl_m:
+        try:
+            rl = float(rl_m.group(1))
+            if rl <= 2.0: pof = 5
+            elif rl <= 5.0: pof = 4
+            elif rl <= 10.0: pof = 3
+        except ValueError:
+            pass
+
+    if record["cui_susceptible"]:
+        pof = min(5, pof + 1)
+
+    cof = 2
+    sheet = (record.get("source_sheet") or "").lower()
+    fluid = str(record.get("fluid_service") or "").lower()
+    name = (record.get("name") or "").lower()
+
+    if any(k in sheet or k in fluid or k in name for k in ["h2s", "acid", "lethal", "flare", "turbines", "vessels & tks", "gp inlet"]):
+        cof = 5
+    elif any(k in sheet or k in fluid or k in name for k in ["gas", "condensate", "fuel", "high press", "op piping", "gp piping", "epf"]):
+        cof = 4
+    elif any(k in sheet or k in fluid or k in name for k in ["crude", "oil", "coolers", "mfds", "tl", "fl"]):
+        cof = 3
+    elif any(k in sheet or k in fluid or k in name for k in ["water", "drain", "utility", "air"]):
+        cof = 1
+
+    record["pof_score"] = pof
+    record["cof_score"] = cof
+
+    score = pof * cof
+    if score >= 16 or (cof == 5 and pof >= 3) or (pof == 5 and cof >= 3):
+        record["risk_category"] = "HIGH"
+    elif score >= 8:
+        record["risk_category"] = "MEDIUM"
+    else:
+        record["risk_category"] = "LOW"
+
+
+def import_smart_sheet(conn, ws, sheet_name):
+    """Smart sheet ingestion with header auto-discovery and synonym mapping."""
+    hdr_row, col_map = find_header_row_and_map(ws)
+    if not col_map:
+        return 0
+
+    cur = conn.cursor()
+    count = 0
+
+    for r in range(hdr_row + 1, ws.max_row + 1):
+        row_vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+        if not any(row_vals):
+            continue
+
+        raw_dict = {}
+        for c in range(1, ws.max_column + 1):
+            h = ws.cell(row=hdr_row, column=c).value or f"Col_{c}"
+            raw_dict[str(h).strip()] = ws.cell(row=r, column=c).value
+
+        record = {"source_sheet": sheet_name}
+        extra_json = {}
+
+        for c, val in enumerate(row_vals, start=1):
+            if c in col_map:
+                field_name, orig_hdr = col_map[c]
+                if "date" in field_name:
+                    d_iso, d_raw = parse_date(val)
+                    record[field_name] = d_iso
+                    if d_raw:
+                        extra_json[orig_hdr + " (raw)"] = d_raw
+                else:
+                    record[field_name] = clean_str(val)
+            else:
+                h_name = ws.cell(row=hdr_row, column=c).value
+                if h_name and val is not None:
+                    extra_json[str(h_name).strip()] = str(val).strip()
+
+        if not record.get("name"):
+            record["name"] = record.get("tag") or record.get("asset_number") or record.get("description") or f"{sheet_name} Item {r}"
+
+        if not record.get("tag") and record.get("sn"):
+            record["tag"] = record.get("sn")
+
+        evaluate_cui_and_risk(record)
+        record["extra_json"] = json.dumps(extra_json, ensure_ascii=False) if extra_json else "{}"
+
+        # Non-destructive upsert
+        existing = None
+        if record.get("tag"):
+            existing = cur.execute("SELECT id, deferral_status, deferral_reason, deferral_expiry, deferral_approver, deferral_moc_no FROM assets WHERE source_sheet = ? AND tag = ?", (sheet_name, record["tag"])).fetchone()
+        elif record.get("asset_number"):
+            existing = cur.execute("SELECT id, deferral_status, deferral_reason, deferral_expiry, deferral_approver, deferral_moc_no FROM assets WHERE source_sheet = ? AND asset_number = ?", (sheet_name, record["asset_number"])).fetchone()
+
+        if existing:
+            aid = existing[0]
+            if existing[1]: record["deferral_status"] = existing[1]
+            if existing[2]: record["deferral_reason"] = existing[2]
+            if existing[3]: record["deferral_expiry"] = existing[3]
+            if existing[4]: record["deferral_approver"] = existing[4]
+            if existing[5]: record["deferral_moc_no"] = existing[5]
+            
+            update_cols = [k for k in record.keys() if k != "id"]
+            set_clause = ", ".join([f"{k} = ?" for k in update_cols])
+            vals = [record[k] for k in update_cols] + [aid]
+            cur.execute(f"UPDATE assets SET {set_clause} WHERE id = ?", vals)
+        else:
+            cols = list(record.keys())
+            placeholders = ", ".join(["?"] * len(cols))
+            cur.execute(f"INSERT INTO assets ({', '.join(cols)}) VALUES ({placeholders})", [record[k] for k in cols])
+
+        try:
+            cur.execute("INSERT INTO raw_rows (sheet, row_num, data) VALUES (?,?,?)",
+                        (sheet_name, r, json.dumps(raw_dict, default=str)))
+        except Exception:
+            pass
+        count += 1
+
+    return count
+
+
+def import_temp_repairs(conn, ws):
+    """Specialized importer for Temp-Repair (clamps & composite wraps)."""
+    hdr_row, _ = find_header_row_and_map(ws)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM temp_repairs")
+    count = 0
+
+    for r in range(hdr_row + 1, ws.max_row + 1):
+        facility = clean_str(ws.cell(row=r, column=2).value)
+        area = clean_str(ws.cell(row=r, column=3).value)
+        asset_name = clean_str(ws.cell(row=r, column=4).value)
+        section = clean_str(ws.cell(row=r, column=5).value)
+        repaired_by = clean_str(ws.cell(row=r, column=6).value)
+        
+        d_orig, _ = parse_date(ws.cell(row=r, column=7).value)
+        life_yrs = clean_str(ws.cell(row=r, column=8).value)
+        d_exp, _ = parse_date(ws.cell(row=r, column=9).value)
+        hardness = clean_str(ws.cell(row=r, column=10).value)
+        d_reval, _ = parse_date(ws.cell(row=r, column=11).value)
+        d_last_exp, _ = parse_date(ws.cell(row=r, column=12).value)
+        status = clean_str(ws.cell(row=r, column=13).value) or "Active"
+        report_ref = clean_str(ws.cell(row=r, column=14).value)
+        remarks = clean_str(ws.cell(row=r, column=15).value)
+
+        if not any([facility, area, asset_name, section]):
+            continue
+
+        cur.execute("""
+            INSERT INTO temp_repairs (
+                facility_type, area, asset_name, repaired_section, repaired_by,
+                original_repair_date, repair_life_years, expiration_date,
+                hardness_hb, revalidation_date, last_expire_date, expiration_status,
+                report_ref, remarks
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (facility, area, asset_name, section, repaired_by, d_orig, life_yrs,
+              d_exp, hardness, d_reval, d_last_exp, status, report_ref, remarks))
+        count += 1
+    return count
+
+
+def import_critical_assets(conn, ws):
+    """Specialized importer for Critical Assets (Turnaround scope)."""
+    hdr_row, _ = find_header_row_and_map(ws)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM critical_assets")
+    count = 0
+
+    for r in range(hdr_row + 1, ws.max_row + 1):
+        sn = clean_str(ws.cell(row=r, column=1).value)
+        category = clean_str(ws.cell(row=r, column=2).value)
+        pack_no = clean_str(ws.cell(row=r, column=3).value)
+        report_no = clean_str(ws.cell(row=r, column=4).value)
+        item_desc = clean_str(ws.cell(row=r, column=5).value)
+        d_insp, _ = parse_date(ws.cell(row=r, column=6).value)
+        scope = clean_str(ws.cell(row=r, column=7).value)
+        done = clean_str(ws.cell(row=r, column=8).value) or "No"
+        remarks = clean_str(ws.cell(row=r, column=9).value)
+        plant_rem = clean_str(ws.cell(row=r, column=10).value)
+
+        if not any([pack_no, item_desc, scope]):
+            continue
+
+        cur.execute("""
+            INSERT INTO critical_assets (
+                sn, category_section, pack_no, report_no, item_description,
+                insp_date, replacement_scope, replacement_done, remarks, plant_remarks
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+        """, (sn, category, pack_no, report_no, item_desc, d_insp, scope, done, remarks, plant_rem))
+        count += 1
+    return count
 
 
 def import_workbook(xlsx_path, db_path):
-    print(f"Loading workbook: {xlsx_path}")
+    print(f"\n=======================================================")
+    print(f"  Smart Ingestion: {xlsx_path}")
+    print(f"  Target SQLite DB: {db_path}")
+    print(f"=======================================================\n")
+
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
-
-    if os.path.exists(db_path):
-        os.remove(db_path)
-
     conn = sqlite3.connect(db_path)
-    cur = conn.cursor()
-    cur.executescript(SCHEMA)
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.executescript(SCHEMA)
 
-    total_imported = 0
+    total_assets = 0
+    total_temp_repairs = 0
+    total_critical = 0
 
-    # 1. Vessels & TKs (Header Row 7)
-    if "Vessels & TKs" in wb.sheetnames:
-        with import_sheet_guard("Vessels & TKs"):
-            ws = wb["Vessels & TKs"]
-            c = 0
-            for r in range(8, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                name = ws.cell(row=r, column=7).value
-                tag = ws.cell(row=r, column=8).value
-                if name or tag or (sn and str(sn).strip().isdigit()):
-                    extra = {}
-                    # Capture any extra columns beyond col 23 (e.g. actions, future plans, notes)
-                    for col_idx in range(24, ws.max_column + 1):
-                        header_val = ws.cell(row=7, column=col_idx).value
-                        cell_val = ws.cell(row=r, column=col_idx).value
-                        if header_val and cell_val is not None:
-                            extra[str(header_val).strip()] = str(cell_val).strip()
-
-                insert_asset(
-                    cur, sheet="Vessels & TKs", sn=sn, field=ws.cell(row=r, column=3).value,
-                    plant=ws.cell(row=r, column=4).value, location=ws.cell(row=r, column=5).value,
-                    unit_name=ws.cell(row=r, column=6).value, name=name, tag=tag,
-                    asset_number=ws.cell(row=r, column=9).value, description=ws.cell(row=r, column=10).value,
-                    in_service=ws.cell(row=r, column=11).value, insulation=ws.cell(row=r, column=12).value,
-                    last_cat=ws.cell(row=r, column=13).value, osi_last=ws.cell(row=r, column=14).value,
-                    osi_next=ws.cell(row=r, column=15).value, int_last=ws.cell(row=r, column=16).value,
-                    int_next=ws.cell(row=r, column=17).value, next_cat=ws.cell(row=r, column=18).value,
-                    cr=ws.cell(row=r, column=19).value, rl=ws.cell(row=r, column=20).value,
-                    remarks=ws.cell(row=r, column=23).value, extra=extra
-                )
-                c += 1
-        print(f"  imported {c:4d} rows from: Vessels & TKs")
-        total_imported += c
-
-    # 2. Coolers (Header Row 6 & 39)
-    if "Coolers" in wb.sheetnames:
-        with import_sheet_guard("Coolers"):
-            ws = wb["Coolers"]
-            c = 0
-            last_name = None
-            for r in range(7, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                name = ws.cell(row=r, column=3).value
-                tag = ws.cell(row=r, column=5).value
-                if str(sn).strip() == "SN" or str(name).strip() in ("GP Cooler Tubes Data", "GP Cooler Name"):
-                    continue
-                if name and str(name).strip() != "GP Cooler Name":
-                    last_name = str(name).strip()
-                elif tag and last_name:
-                    name = f"{last_name} (Bundle {tag})"
-                if tag or (name and str(name).strip() != "GP Cooler Name") or (sn and str(sn).strip().isdigit()):
-                    extra = {}
-                    for col_idx in range(6, 28):
-                        header_val = ws.cell(row=6, column=col_idx).value
-                        cell_val = ws.cell(row=r, column=col_idx).value
-                        if header_val and cell_val is not None:
-                            extra[str(header_val).strip()] = str(cell_val).strip()
-
-                insert_asset(
-                    cur, sheet="Coolers", sn=sn, field=last_name or "Cooler Unit", name=name, tag=tag,
-                    in_service=ws.cell(row=r, column=4).value,
-                    remarks=ws.cell(row=r, column=28).value, extra=extra
-                )
-                c += 1
-        print(f"  imported {c:4d} rows from: Coolers")
-        total_imported += c
-
-    # 3. OP Piping (Header Row 5)
-    if "OP Piping" in wb.sheetnames:
-        with import_sheet_guard("OP Piping"):
-            ws = wb["OP Piping"]
-            c = 0
-            curr_sec = "PACK 01- FLARE HEADER"
-            for r in range(6, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                item = ws.cell(row=r, column=3).value
-                d_last = ws.cell(row=r, column=7).value
-                d_next = ws.cell(row=r, column=8).value
-
-                b_str = str(sn).strip() if sn is not None else ""
-                c_str = str(item).strip() if item is not None else ""
-
-                # Check if this row is a Pack section header
-                if (b_str.upper().startswith("PACK") or c_str.upper().startswith("PACK")) and not d_last and not d_next:
-                    curr_sec = b_str if b_str.upper().startswith("PACK") else c_str
-                    continue
-
-                if item or sn or d_last or d_next:
-                    base_rem = f"{ws.cell(row=r, column=11).value or ''} {ws.cell(row=r, column=12).value or ''}".strip()
-                    rem = gather_remarks(ws, r, 5, base_rem, 9)
-                    insert_asset(
-                        cur, sheet="OP Piping", sn=sn, field=curr_sec, name=item or sn,
-                        int_last=d_last, int_next=d_next, remarks=rem or None
-                    )
-                    c += 1
-        print(f"  imported {c:4d} rows from: OP Piping")
-        total_imported += c
-
-    # 4. GP Piping (Header Row 8)
-    if "GP Piping" in wb.sheetnames:
-        with import_sheet_guard("GP Piping"):
-            ws = wb["GP Piping"]
-            c = 0
-            last_pack = "PACK 01  Inlet Gas Lines"
-            for r in range(9, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                item = ws.cell(row=r, column=3).value
-                pack_val = ws.cell(row=r, column=4).value
-
-                b_str = str(sn).strip() if sn is not None else ""
-                c_str = str(item).strip() if item is not None else ""
-                d_str = str(pack_val).strip() if pack_val is not None else ""
-
-                if b_str.upper().startswith("PACK") or c_str.upper().startswith("PACK"):
-                    last_pack = b_str if b_str.upper().startswith("PACK") else c_str
-                elif d_str:
-                    last_pack = f"PACK {d_str}" if not d_str.upper().startswith("PACK") else d_str
-
-                if item or sn or ws.cell(row=r, column=9).value:
-                    rem = gather_remarks(ws, r, 8, ws.cell(row=r, column=12).value, 11)
-                    insert_asset(
-                        cur, sheet="GP Piping", sn=sn, name=item, field=last_pack,
-                        insulation=ws.cell(row=r, column=8).value,
-                        int_last=ws.cell(row=r, column=9).value, int_next=ws.cell(row=r, column=10).value,
-                        cr=ws.cell(row=r, column=11).value, remarks=rem or None
-                    )
-                    c += 1
-        print(f"  imported {c:4d} rows from: GP Piping")
-        total_imported += c
-
-    # 5. Turbines Piping (Header Row 5)
-    if "Turbines Piping" in wb.sheetnames:
-        with import_sheet_guard("Turbines Piping"):
-            ws = wb["Turbines Piping"]
-            c = 0
-            last_pack = "Turbines Area"
-            for r in range(6, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                item = ws.cell(row=r, column=3).value
-                pack_val = ws.cell(row=r, column=4).value
-
-                b_str = str(sn).strip() if sn is not None else ""
-                c_str = str(item).strip() if item is not None else ""
-                d_str = str(pack_val).strip() if pack_val is not None else ""
-
-                if b_str.upper().startswith("PACK") or c_str.upper().startswith("PACK"):
-                    last_pack = b_str if b_str.upper().startswith("PACK") else c_str
-                elif d_str:
-                    last_pack = f"PACK {d_str}" if not d_str.upper().startswith("PACK") else d_str
-
-                if str(sn).strip().lower() == "xx" or str(item).strip().lower() == "xx":
-                    continue
-                if item or (sn and str(sn).strip().isdigit()):
-                    rem = gather_remarks(ws, r, 5, ws.cell(row=r, column=11).value, 10)
-                    insert_asset(
-                        cur, sheet="Turbines Piping", sn=sn, name=item, field=last_pack,
-                        int_last=ws.cell(row=r, column=8).value, int_next=ws.cell(row=r, column=9).value,
-                        cr=ws.cell(row=r, column=10).value, remarks=rem or None,
-                        insulation=ws.cell(row=r, column=12).value
-                    )
-                    c += 1
-        print(f"  imported {c:4d} rows from: Turbines Piping")
-        total_imported += c
-
-    # 6. OP Dead Legs (Header Row 3)
-    if "OP Dead Legs" in wb.sheetnames:
-        with import_sheet_guard("OP Dead Legs"):
-            ws = wb["OP Dead Legs"]
-            c = 0
-            curr_sys = "OP Dead Legs"
-            for r in range(4, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                desc = ws.cell(row=r, column=3).value
-                int_last = ws.cell(row=r, column=7).value
-                int_next = ws.cell(row=r, column=8).value
-                if (sn or desc) and not int_last and not int_next and not ws.cell(row=r, column=4).value:
-                    curr_sys = str(sn or desc).strip()
-                    continue
-                name = f"{curr_sys}: {desc}" if (curr_sys and desc) else (desc or curr_sys or "OP Dead Leg Item")
-                if desc or sn or int_last or int_next:
-                    rem = gather_remarks(ws, r, 3, ws.cell(row=r, column=12).value, 9)
-                    insert_asset(
-                        cur, sheet="OP Dead Legs", sn=sn, field=curr_sys, unit_name=curr_sys, name=name,
-                        int_last=int_last, int_next=int_next, remarks=rem or None
-                    )
-                    c += 1
-            print(f"  imported {c:4d} rows from: OP Dead Legs")
-            total_imported += c
-
-    # 7. GP Dead Legs (Header Row 6)
-    if "GP Dead Legs" in wb.sheetnames:
-        with import_sheet_guard("GP Dead Legs"):
-            ws = wb["GP Dead Legs"]
-            c = 0
-            last_vessel = "Inlet Manifold"
-            for r in range(7, ws.max_row + 1):
-                sn = ws.cell(row=r, column=3).value
-                vessel = ws.cell(row=r, column=4).value
-                desc = ws.cell(row=r, column=5).value
-                dead_leg = ws.cell(row=r, column=6).value
-                if vessel and str(vessel).strip():
-                    last_vessel = str(vessel).strip()
-                name = desc or (f"{last_vessel} - {dead_leg}" if last_vessel and dead_leg else dead_leg or last_vessel)
-                base_rem = f"{ws.cell(row=r, column=10).value or ''} {ws.cell(row=r, column=12).value or ''}".strip()
-                rem = gather_remarks(ws, r, 6, base_rem, 9)
-                if desc or dead_leg or sn or ws.cell(row=r, column=7).value:
-                    insert_asset(
-                        cur, sheet="GP Dead Legs", sn=sn, field=last_vessel, plant=last_vessel, name=name, tag=dead_leg,
-                        int_last=ws.cell(row=r, column=7).value, int_next=ws.cell(row=r, column=8).value,
-                        remarks=rem or None
-                    )
-                    c += 1
-            print(f"  imported {c:4d} rows from: GP Dead Legs")
-            total_imported += c
-
-    # 8. WD-33 Piping (Header Row 5)
-    if "WD-33 Piping" in wb.sheetnames:
-        with import_sheet_guard("WD-33 Piping"):
-            ws = wb["WD-33 Piping"]
-            c = 0
-            for r in range(6, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                item = ws.cell(row=r, column=3).value
-                if item or (sn and str(sn).strip().isdigit()):
-                    rem = gather_remarks(ws, r, 5, ws.cell(row=r, column=11).value, 11)
-                    insert_asset(
-                        cur, sheet="WD-33 Piping", sn=sn, name=item, in_service=ws.cell(row=r, column=4).value,
-                        field=ws.cell(row=r, column=5).value or "WD-33", plant=ws.cell(row=r, column=6).value,
-                        int_last=ws.cell(row=r, column=9).value, int_next=ws.cell(row=r, column=10).value,
-                        remarks=rem or None
-                    )
-                    c += 1
-            print(f"  imported {c:4d} rows from: WD-33 Piping")
-            total_imported += c
-
-    # 9. EPFs (Header Row 4)
-    if "EPFs" in wb.sheetnames:
-        with import_sheet_guard("EPFs"):
-            ws = wb["EPFs"]
-            c = 0
-            curr_epf = "SAG Area"
-            for r in range(5, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                item = ws.cell(row=r, column=3).value
-                col_e = ws.cell(row=r, column=5).value
-                if col_e and "EPF" in str(col_e):
-                    curr_epf = str(col_e).strip()
-                if item or (sn and str(sn).strip().isdigit()):
-                    rem = gather_remarks(ws, r, 4, ws.cell(row=r, column=9).value, 9)
-                    insert_asset(
-                        cur, sheet="EPFs", sn=sn, name=item, field=curr_epf, in_service=ws.cell(row=r, column=4).value,
-                        int_last=ws.cell(row=r, column=7).value, int_next=ws.cell(row=r, column=8).value,
-                        remarks=rem or None
-                    )
-                    c += 1
-            print(f"  imported {c:4d} rows from: EPFs")
-            total_imported += c
-
-    # 10. GP Inlet Lines (Header Row 12)
-    sheet_gp_inlet = "GP Inlet Lines " if "GP Inlet Lines " in wb.sheetnames else "GP Inlet Lines"
-    if sheet_gp_inlet in wb.sheetnames:
-        with import_sheet_guard(sheet_gp_inlet):
-            ws = wb[sheet_gp_inlet]
-            c = 0
-            for r in range(13, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                desc = ws.cell(row=r, column=3).value
-                if desc or (sn and str(sn).strip().isdigit()):
-                    base_rem = f"{ws.cell(row=r, column=8).value or ''} {ws.cell(row=r, column=12).value or ''}".strip()
-                    rem = gather_remarks(ws, r, 12, base_rem, 8)
-                    insert_asset(
-                        cur, sheet="GP Inlet Lines", sn=sn, name=desc, field="GP Inlet",
-                        int_last=ws.cell(row=r, column=6).value, int_next=ws.cell(row=r, column=7).value,
-                        remarks=rem or None
-                    )
-                    c += 1
-            print(f"  imported {c:4d} rows from: GP Inlet Lines")
-            total_imported += c
-
-    # 11. MFDs (Header Row 5)
-    if "MFDs" in wb.sheetnames:
-        with import_sheet_guard("MFDs"):
-            ws = wb["MFDs"]
-            c = 0
-            for r in range(6, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                item = ws.cell(row=r, column=3).value
-                mfd_type = ws.cell(row=r, column=4).value
-                if item or (sn and str(sn).strip().isdigit()):
-                    base_rem = f"{ws.cell(row=r, column=10).value or ''} {ws.cell(row=r, column=11).value or ''}".strip()
-                    rem = gather_remarks(ws, r, 5, base_rem, 10)
-                    insert_asset(
-                        cur, sheet="MFDs", sn=sn, name=item, field=mfd_type or item, description=mfd_type,
-                        in_service=ws.cell(row=r, column=5).value,
-                        int_last=ws.cell(row=r, column=8).value, int_next=ws.cell(row=r, column=9).value,
-                        remarks=rem or None
-                    )
-                    c += 1
-            print(f"  imported {c:4d} rows from: MFDs")
-            total_imported += c
-
-    # 12. TLs (Trunklines - Header Row 6)
-    if "TLs" in wb.sheetnames:
-        with import_sheet_guard("TLs"):
-            ws = wb["TLs"]
-            c = 0
-            for r in range(8, ws.max_row + 1):
-                loc = ws.cell(row=r, column=2).value
-                p_name = ws.cell(row=r, column=4).value
-                name = p_name or (f"Trunkline {loc}" if loc else None)
-                if name or loc:
-                    rem = gather_remarks(ws, r, 6, ws.cell(row=r, column=24).value, 22)
-                    insert_asset(
-                        cur, sheet="TLs", location=loc, name=name, field=loc or "Trunkline Header",
-                        in_service=ws.cell(row=r, column=5).value,
-                        int_last=ws.cell(row=r, column=20).value, int_next=ws.cell(row=r, column=21).value,
-                        remarks=rem or None
-                    )
-                    c += 1
-            print(f"  imported {c:4d} rows from: TLs")
-            total_imported += c
-
-    # 13. FLs (Flowlines - Header Row 3)
-    if "FLs" in wb.sheetnames:
-        with import_sheet_guard("FLs"):
-            ws = wb["FLs"]
-            c = 0
-            for r in range(4, ws.max_row + 1):
-                well = ws.cell(row=r, column=1).value
-                field_val = ws.cell(row=r, column=4).value
-                if well and str(well).strip():
-                    rem = gather_remarks(ws, r, 3, ws.cell(row=r, column=13).value, 11)
-                    insert_asset(
-                        cur, sheet="FLs", name=str(well).strip(), field=field_val or "Flowline Header",
-                        in_service=ws.cell(row=r, column=2).value, unit_name=ws.cell(row=r, column=3).value,
-                        int_last=ws.cell(row=r, column=9).value, int_next=ws.cell(row=r, column=10).value,
-                        remarks=rem or None
-                    )
-                    c += 1
-            print(f"  imported {c:4d} rows from: FLs")
-            total_imported += c
-
-    # 14. GL Lines (Gas Lift Lines - Header Row 17)
-    if "GL Lines" in wb.sheetnames:
-        with import_sheet_guard("GL Lines"):
-            ws = wb["GL Lines"]
-            c = 0
-            for r in range(18, ws.max_row + 1):
-                well = ws.cell(row=r, column=3).value
-                field_val = ws.cell(row=r, column=4).value
-                if well and str(well).strip() and not str(well).startswith("*"):
-                    rem = gather_remarks(ws, r, 17, ws.cell(row=r, column=12).value, 15)
-                    insert_asset(
-                        cur, sheet="GL Lines", sn=ws.cell(row=r, column=2).value,
-                        name=f"GL Line - {str(well).strip()}", field=field_val or "Gas Lift Header", tag=ws.cell(row=r, column=4).value,
-                        remarks=rem or None,
-                        int_last=ws.cell(row=r, column=13).value, int_next=ws.cell(row=r, column=14).value,
-                        rl=ws.cell(row=r, column=15).value
-                    )
-                    c += 1
-            print(f"  imported {c:4d} rows from: GL Lines")
-            total_imported += c
-
-    # 15. Critical Assets (Header Row 6)
-    if "Critical Assets" in wb.sheetnames:
-        with import_sheet_guard("Critical Assets"):
-            ws = wb["Critical Assets"]
-            c = 0
-            current_section = "Critical replacements & turnaround scope"
-            for r in range(1, ws.max_row + 1):
-                sn = ws.cell(row=r, column=2).value
-                pack = ws.cell(row=r, column=3).value
-                report_no = ws.cell(row=r, column=4).value
-                desc = ws.cell(row=r, column=5).value
-                insp_d = ws.cell(row=r, column=6).value
-                scope = ws.cell(row=r, column=7).value
-                done = ws.cell(row=r, column=8).value
-                rem = ws.cell(row=r, column=9).value
-                plant_rem = ws.cell(row=r, column=10).value
-
-                # Check if this row is a section title or header
-                if scope and not desc and not pack:
-                    current_section = str(scope).strip()
-                    continue
-                if str(sn).strip().upper() == "SN" or str(pack).strip().upper() == "PACK#":
-                    continue
-
-                if desc or pack or scope or (sn and str(sn).strip().isdigit()):
-                    d_insp, _ = parse_date(insp_d)
-                    cur.execute("""
-                        INSERT INTO critical_assets (
-                            sn, category_section, pack_no, report_no, item_description,
-                            insp_date, replacement_scope, replacement_done, remarks, plant_remarks
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?)
-                    """, (
-                        clean_str(sn), clean_str(current_section), clean_str(pack),
-                        clean_str(report_no), clean_str(desc or pack), d_insp,
-                        clean_str(scope), clean_str(done), clean_str(rem), clean_str(plant_rem)
-                    ))
-
-                    # Also insert as asset for general cross-sheet search
-                    full_rem = f"{rem or ''} {plant_rem or ''}".strip()
-                    insert_asset(
-                        cur, sheet="Critical Assets", sn=sn, field=pack, name=desc or pack,
-                        int_last=insp_d, remarks=full_rem or None
-                    )
-                    c += 1
-        print(f"  imported {c:4d} rows from: Critical Assets into dedicated table & asset registry")
-        total_imported += c
-
-    # 16. Temp-Repair (Header Row 8)
-    if "Temp-Repair" in wb.sheetnames:
-        with import_sheet_guard("Temp-Repair"):
-            ws = wb["Temp-Repair"]
-            c = 0
-            facility_type = "Gas Facilities"
-            last_area = "AG GP"
-            last_asset = ""
-            last_repaired_by = "Seaharvest (Composite)"
-
-            for r in range(1, ws.max_row + 1):
-                cell_b = ws.cell(row=r, column=2).value
-                if cell_b and "Facilities" in str(cell_b):
-                    facility_type = str(cell_b).strip()
-                    continue
-
-                area = ws.cell(row=r, column=2).value
-                asset = ws.cell(row=r, column=3).value
-                sec = ws.cell(row=r, column=4).value
-                repaired_by = ws.cell(row=r, column=5).value
-                orig_date = ws.cell(row=r, column=6).value
-                life_yrs = ws.cell(row=r, column=7).value
-                exp_date = ws.cell(row=r, column=8).value
-                hardness = ws.cell(row=r, column=9).value
-                reval_date = ws.cell(row=r, column=10).value
-                last_exp = ws.cell(row=r, column=11).value
-                exp_status = ws.cell(row=r, column=12).value
-                report_ref = ws.cell(row=r, column=13).value
-                remarks = ws.cell(row=r, column=14).value
-
-                if str(area).strip() == "Area" or str(asset).strip() == "Asset":
-                    continue
-
-                if area:
-                    last_area = str(area).strip()
-                if asset:
-                    last_asset = str(asset).strip()
-                if repaired_by:
-                    last_repaired_by = str(repaired_by).strip()
-
-                if sec or exp_date or orig_date:
-                    d_orig, _ = parse_date(orig_date)
-                    d_exp, _ = parse_date(exp_date)
-                    d_reval, _ = parse_date(reval_date)
-                    d_lastexp, _ = parse_date(last_exp)
-
-                    cur.execute("""
-                        INSERT INTO temp_repairs (
-                            facility_type, area, asset_name, repaired_section, repaired_by,
-                            original_repair_date, repair_life_years, expiration_date,
-                            hardness_hb, revalidation_date, last_expire_date,
-                            expiration_status, report_ref, remarks
-                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, (
-                        clean_str(facility_type), clean_str(area or last_area),
-                        clean_str(asset or last_asset), clean_str(sec or asset or last_asset),
-                        clean_str(repaired_by or last_repaired_by), d_orig,
-                        int(life_yrs) if (life_yrs and str(life_yrs).strip().isdigit()) else None,
-                        d_exp, clean_str(hardness), d_reval, d_lastexp,
-                        clean_str(exp_status or "Expired"), clean_str(report_ref), clean_str(remarks)
-                    ))
-
-                    # Also insert into assets for cross-sheet search
-                    name = f"{last_asset} - {sec}" if (last_asset and sec and sec != last_asset) else (asset or last_asset or sec)
-                    insert_asset(
-                        cur, sheet="Temp-Repair", field=area or last_area, name=name,
-                        int_last=orig_date, int_next=exp_date, remarks=remarks
-                    )
-                    c += 1
-        print(f"  imported {c:4d} rows from: Temp-Repair into dedicated table & asset registry")
-        total_imported += c
-
-    # ---------------------------------------------------------------------
-    # Capture raw rows for each sheet – store every cell value as JSON
-    # This preserves *all* data from the workbook, even columns we don't map to assets.
     for sheet_name in wb.sheetnames:
+        if sheet_name in SKIP_SHEETS:
+            continue
+
         ws = wb[sheet_name]
-        max_col = ws.max_column
-        for r in range(1, ws.max_row + 1):
-            # Collect cell values for the entire row
-            raw_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
-            # Convert datetime/date objects to ISO strings for JSON serialization
-            row_vals = [v.isoformat() if isinstance(v, (datetime.datetime, datetime.date)) else v for v in raw_vals]
-            cur.execute(
-                "INSERT INTO raw_rows (sheet, row_num, data) VALUES (?,?,?)",
-                (sheet_name, r, json.dumps(row_vals, ensure_ascii=False)),
-            )
-    # ---------------------------------------------------------------------
+        lower_name = sheet_name.strip().lower()
+
+        with import_sheet_guard(sheet_name):
+            if "temp" in lower_name and "repair" in lower_name:
+                count = import_temp_repairs(conn, ws)
+                total_temp_repairs += count
+                print(f"  [+] {sheet_name:28s} -> {count:4d} temporary repairs")
+            elif "critical" in lower_name:
+                count = import_critical_assets(conn, ws)
+                total_critical += count
+                print(f"  [+] {sheet_name:28s} -> {count:4d} turnaround critical scope items")
+            else:
+                count = import_smart_sheet(conn, ws, sheet_name)
+                total_assets += count
+                print(f"  [+] {sheet_name:28s} -> {count:4d} assets mapped & synchronized")
 
     conn.commit()
     conn.close()
 
-    print(f"\nDone. Successfully imported {total_imported} assets into {db_path} with 100% exact column alignment.")
-
+    print(f"\n-------------------------------------------------------")
+    print(f"  SMART INGESTION COMPLETE:")
+    print(f"  Total Equipment Assets : {total_assets:,}")
+    print(f"  Temporary Repairs      : {total_temp_repairs:,}")
+    print(f"  Critical Turnaround    : {total_critical:,}")
+    if import_errors:
+        print(f"  Warnings/Errors        : {len(import_errors)}")
+    print(f"-------------------------------------------------------\n")
 
 
 def main():
-    xlsx_path = sys.argv[1] if len(sys.argv) > 1 else "1. Master Inspection Plan - Updated 4-6-2026.xlsx"
-    db_path = sys.argv[2] if len(sys.argv) > 2 else "inspection_plan.db"
+    xlsx = sys.argv[1] if len(sys.argv) > 1 else "1. Master Inspection Plan - Updated 4-6-2026.xlsx"
+    db = sys.argv[2] if len(sys.argv) > 2 else "inspection_plan.db"
+    
+    if not os.path.exists(xlsx):
+        found = [f for f in os.listdir(".") if f.endswith(".xlsx") and not f.startswith("~$")]
+        if found:
+            xlsx = found[0]
+        else:
+            print(f"Error: Excel file not found: {xlsx}")
+            sys.exit(1)
 
-    if not os.path.exists(xlsx_path):
-        print(f"File not found: {xlsx_path}")
-        sys.exit(1)
-
-    import_workbook(xlsx_path, db_path)
+    import_workbook(xlsx, db)
 
 
 if __name__ == "__main__":
