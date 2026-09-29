@@ -61,11 +61,40 @@ function statusPill(asset) {
   if (asset.is_deferred) {
     return `<span class="status-pill deferred" title="Approved MOC Deferral until ${asset.deferral_expiry || ''}">🛡️ DEFERRED (${fmtDate(asset.deferral_expiry)})</span>`;
   }
+  if (asset.is_next_sd) {
+    return `<span class="status-pill warning" title="Scheduled for Next Shutdown">⚠️ NEXT SD</span>`;
+  }
+  if (asset.is_waiting_eval) {
+    return `<span class="status-pill info" title="Waiting for Evaluation">ℹ️ W/EVAL</span>`;
+  }
+  if (asset.status_osi_next === "OOS" || asset.status_internal_next === "OOS") {
+    return `<span class="status-pill none" title="Out of Service">OUT OF SERVICE</span>`;
+  }
+
+  // Check overdue flags
+  if (asset.is_overdue) {
+    let overdueLabel = "OVERDUE";
+    if (asset.overdue_type === "Both") {
+      overdueLabel = "OVERDUE (Both)";
+    } else if (asset.overdue_type === "Internal") {
+      overdueLabel = "OVERDUE (Internal SD)";
+    } else if (asset.overdue_type === "OSI") {
+      overdueLabel = "OVERDUE (OSI)";
+    }
+    const days = daysFromToday(asset.next_due);
+    const dayStr = days !== null ? ` ${Math.abs(days)}d` : "";
+    return `<span class="status-pill overdue" title="Inspection Overdue">${overdueLabel}${dayStr}</span>`;
+  }
+
   const nd = asset.next_due;
-  if (!nd) return `<span class="status-pill none">No due date</span>`;
+  if (!nd) {
+    if (asset.status_osi_next || asset.status_internal_next) {
+      return `<span class="status-pill none">${esc(asset.status_osi_next || asset.status_internal_next)}</span>`;
+    }
+    return `<span class="status-pill none">No due date</span>`;
+  }
   const days = daysFromToday(nd);
-  if (days < 0) return `<span class="status-pill overdue">OVERDUE ${Math.abs(days)}d</span>`;
-  if (days <= 30) return `<span class="status-pill soon">DUE ${days}d</span>`;
+  if (days !== null && days <= 30) return `<span class="status-pill soon">DUE ${days}d</span>`;
   return `<span class="status-pill ok">${fmtDate(nd)}</span>`;
 }
 
@@ -107,7 +136,17 @@ function switchView(view) {
     if (!document.getElementById("yearInput").value) {
       document.getElementById("yearInput").value = new Date().getFullYear();
     }
+    const ysel = document.getElementById("yearlySheetFilter");
+    if (ysel && (!ysel.options || ysel.options.length <= 1) && state.sheets && state.sheets.length) {
+      const currentY = ysel.value;
+      ysel.innerHTML = `<option value="">All Sheets (Global)</option>` + 
+        state.sheets.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+      ysel.value = currentY;
+    }
     loadYearlyPlan();
+  }
+  if (view === "reconciliation") {
+    loadReconciliation();
   }
 }
 
@@ -131,9 +170,36 @@ function assetRowHtml(a, compact) {
     </tr>`;
   }
 
-  const lastInsp = a.date_osi_last || a.date_internal_last || "—";
-  const nextInsp = a.date_osi_next || a.date_internal_next || "—";
   const press = a.operating_pressure ? `${esc(a.operating_pressure)} psi` : (a.design_pressure ? `${esc(a.design_pressure)} psi (des)` : "—");
+
+  // Format OSI timeline
+  const osiLast = a.date_osi_last || a.date_osi_last_raw;
+  const osiNext = a.date_osi_next || a.date_osi_next_raw || a.status_osi_next;
+  const osiHtml = (osiLast || osiNext) ? `
+    <div style="font-size:11.5px; line-height:1.4;">
+      <span class="badge-scope osi">OSI</span>
+      <span style="color:var(--text-muted);">Last:</span> <b style="color:#fff;">${fmtDate(osiLast)}</b>
+      <span style="color:var(--text-muted); margin-left:4px;">Next:</span> <b style="color:${a.osi_overdue ? 'var(--danger)' : 'var(--accent)'};">${fmtDate(osiNext)}</b>
+    </div>` : "";
+
+  // Format Internal timeline
+  const intLast = a.date_internal_last || a.date_internal_last_raw;
+  const intNext = a.date_internal_next || a.date_internal_next_raw || a.status_internal_next;
+  const intHtml = (intLast || intNext) ? `
+    <div style="font-size:11.5px; line-height:1.4; margin-top:2px;">
+      <span class="badge-scope internal">Internal</span>
+      <span style="color:var(--text-muted);">Last:</span> <b style="color:#fff;">${fmtDate(intLast)}</b>
+      <span style="color:var(--text-muted); margin-left:4px;">Next:</span> <b style="color:${a.internal_overdue ? 'var(--danger)' : 'var(--accent)'};">${fmtDate(intNext)}</b>
+    </div>` : "";
+
+  const planScopeHtml = a.plan_insp_type ? `
+    <div style="margin-bottom:3px;">
+      <span class="badge-scope ${a.plan_insp_type.toLowerCase().includes('internal') ? 'internal' : (a.plan_insp_type.toLowerCase().includes('osi') ? 'osi' : 'both')}">
+        🗓️ Planned: ${esc(a.plan_insp_type)} (${fmtDate(a.plan_date)})
+      </span>
+    </div>` : "";
+
+  const timelineContent = (osiHtml || intHtml) ? (planScopeHtml + osiHtml + intHtml) : `<span style="color:var(--text-muted); font-size:12px;">No schedule recorded</span>`;
 
   return `<tr data-id="${a.id}">
     ${checkTd}
@@ -144,15 +210,12 @@ function assetRowHtml(a, compact) {
     <td><span class="tag-mono" style="font-weight:600; color:var(--accent);">${esc(a.source_sheet || "")}</span></td>
     <td>${statusPill(a)}</td>
     <td><span class="tag-mono" style="font-weight:600; color:#fff;">${esc(a.field || "—")}</span></td>
-    <td>
-      <div style="font-size:12px; color:var(--text-muted);">Last: <b style="color:#fff;">${fmtDate(lastInsp)}</b></div>
-      <div style="font-size:12px; color:var(--accent);">Next: <b>${fmtDate(nextInsp)}</b></div>
-    </td>
+    <td>${timelineContent}</td>
     <td>
       <div style="font-size:12px; color:#fff;">${press}</div>
       ${a.nominal_thickness ? `<div style="font-size:11px; color:var(--text-faint);">Thk: ${esc(a.nominal_thickness)} mm</div>` : ""}
     </td>
-    <td><div style="max-width:240px; font-size:12px; color:var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${esc(a.remarks || loc)}</div></td>
+    <td><div style="max-width:240px; font-size:12px; color:var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${esc(a.remarks || loc)}">${esc(a.remarks || loc)}</div></td>
   </tr>`;
 }
 
@@ -289,9 +352,21 @@ async function loadDashboard() {
           <div class="n">${d.total_assets}</div>
           <div class="label">Total Tracked Assets</div>
         </div>
-        <div class="stat-card overdue">
+        <div class="stat-card overdue" onclick="filterByOverdueType('')" style="cursor:pointer;" title="Click to view all overdue">
           <div class="n">${d.overdue_count}</div>
-          <div class="label">Overdue Inspections</div>
+          <div class="label">Total Overdue</div>
+        </div>
+        <div class="stat-card overdue" onclick="filterByOverdueType('internal')" style="cursor:pointer; border-color:#e05252;" title="Click to view Internal Overdue (requires Shutdown)">
+          <div class="n">${d.overdue_internal_count || 0}</div>
+          <div class="label">Internal Overdue (SD)</div>
+        </div>
+        <div class="stat-card overdue" onclick="filterByOverdueType('osi')" style="cursor:pointer; border-color:#ff9800;" title="Click to view OSI Overdue (On-Stream)">
+          <div class="n">${d.overdue_osi_count || 0}</div>
+          <div class="label">OSI Overdue (On-Stream)</div>
+        </div>
+        <div class="stat-card" onclick="filterBySpecialStatus('next_sd')" style="cursor:pointer; border-color:rgba(255,171,0,0.4);" title="Click to view assets scheduled for Next Shutdown">
+          <div class="n" style="color:#ffab00;">${d.next_sd_count || 0}</div>
+          <div class="label">Next Shutdown (SD)</div>
         </div>
         <div class="stat-card highrisk">
           <div class="n">${d.high_risk_count}</div>
@@ -399,6 +474,14 @@ async function loadDashboard() {
           d.sheets.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
         sel.value = current;
       }
+
+      const ysel = document.getElementById("yearlySheetFilter");
+      if (ysel) {
+        const currentY = ysel.value;
+        ysel.innerHTML = `<option value="">All Sheets (Global)</option>` + 
+          d.sheets.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+        ysel.value = currentY;
+      }
       
       renderSheetTabs(d.sheets, sel ? sel.value : "");
     }
@@ -458,6 +541,26 @@ window.filterByDeferral = function(status) {
   switchView("assets");
 };
 
+window.filterByOverdueType = function(type) {
+  const oo = document.getElementById("overdueOnly");
+  if (oo) oo.checked = true;
+  const otf = document.getElementById("overdueTypeFilter");
+  if (otf) otf.value = type;
+  const ssf = document.getElementById("specialStatusFilter");
+  if (ssf) ssf.value = "";
+  switchView("assets");
+};
+
+window.filterBySpecialStatus = function(st) {
+  const oo = document.getElementById("overdueOnly");
+  if (oo) oo.checked = false;
+  const otf = document.getElementById("overdueTypeFilter");
+  if (otf) otf.value = "";
+  const ssf = document.getElementById("specialStatusFilter");
+  if (ssf) ssf.value = st;
+  switchView("assets");
+};
+
 // ---------------------------------------------------------------- Assets Inventory
 let searchDebounce = null;
 const searchBox = document.getElementById("searchBox");
@@ -485,6 +588,8 @@ if (btnClearSearch) {
 
 document.getElementById("sheetFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
 document.getElementById("riskFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
+document.getElementById("overdueTypeFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
+document.getElementById("specialStatusFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
 document.getElementById("agingFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
 document.getElementById("deferralFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
 document.getElementById("groupFilter")?.addEventListener("change", () => { state.page = 1; loadAssets(); });
@@ -495,6 +600,8 @@ document.getElementById("btnResetFilters")?.addEventListener("click", () => {
   if (btnClearSearch) btnClearSearch.style.display = "none";
   const sf = document.getElementById("sheetFilter"); if (sf) sf.value = "";
   const rf = document.getElementById("riskFilter"); if (rf) rf.value = "";
+  const otf = document.getElementById("overdueTypeFilter"); if (otf) otf.value = "";
+  const ssf = document.getElementById("specialStatusFilter"); if (ssf) ssf.value = "";
   const af = document.getElementById("agingFilter"); if (af) af.value = "";
   const df = document.getElementById("deferralFilter"); if (df) df.value = "";
   const gf = document.getElementById("groupFilter"); if (gf) gf.value = "";
@@ -531,6 +638,8 @@ async function loadAssets() {
     const q = searchBox ? searchBox.value.trim() : "";
     const sheet = document.getElementById("sheetFilter")?.value || "";
     const risk = document.getElementById("riskFilter")?.value || "";
+    const overdueType = document.getElementById("overdueTypeFilter")?.value || "";
+    const specialStatus = document.getElementById("specialStatusFilter")?.value || "";
     const aging = document.getElementById("agingFilter")?.value || "";
     const deferral = document.getElementById("deferralFilter")?.value || "";
     const overdue = document.getElementById("overdueOnly")?.checked ? "1" : "0";
@@ -538,6 +647,8 @@ async function loadAssets() {
 
     const params = new URLSearchParams({
       q, sheet, risk, overdue,
+      overdue_type: overdueType,
+      status: specialStatus,
       aging, deferral,
       rbi_cell: state.activeRbiCell
     });
@@ -784,6 +895,7 @@ const ENVELOPE_FIELDS = [
 const DATE_FIELDS = [
   ["date_osi_last", "Last OSI Inspection Date"], ["date_osi_next", "Next OSI Due Date"],
   ["date_internal_last", "Last Internal Inspection Date"], ["date_internal_next", "Next Internal Due Date"],
+  ["status_osi_next", "OSI Status / Condition"], ["status_internal_next", "Internal Status / Condition"],
 ];
 
 function fieldInput(key, label, value, type) {
@@ -1241,17 +1353,48 @@ async function loadTempRepairs() {
 
 // ---------------------------------------------------------------- Yearly Plan
 document.getElementById("btnLoadYear")?.addEventListener("click", loadYearlyPlan);
+document.getElementById("yearlySheetFilter")?.addEventListener("change", loadYearlyPlan);
+document.getElementById("yearlyTypeFilter")?.addEventListener("change", loadYearlyPlan);
 document.getElementById("btnPrintYear")?.addEventListener("click", () => window.print());
+document.getElementById("btnExportYearlyExcel")?.addEventListener("click", () => {
+  const y = document.getElementById("yearInput")?.value || new Date().getFullYear();
+  const sheet = document.getElementById("yearlySheetFilter")?.value || "";
+  const type = document.getElementById("yearlyTypeFilter")?.value || "all";
+  const params = new URLSearchParams({ year: y, sheet, type });
+  window.location.href = `/api/yearly_plan/export.xlsx?` + params.toString();
+});
 
 async function loadYearlyPlan() {
   try {
     const yearInput = document.getElementById("yearInput");
     const year = yearInput ? yearInput.value : new Date().getFullYear();
-    const rows = await api("/api/yearly_plan?year=" + encodeURIComponent(year));
+    const sheetFilter = document.getElementById("yearlySheetFilter");
+    const selectedSheet = sheetFilter ? sheetFilter.value : "";
+    const typeFilter = document.getElementById("yearlyTypeFilter");
+    const scopeType = typeFilter ? typeFilter.value : "all";
+
+    // Ensure sheet options are populated if empty
+    if (sheetFilter && (!sheetFilter.options || sheetFilter.options.length <= 1) && state.sheets && state.sheets.length) {
+      sheetFilter.innerHTML = `<option value="">All Sheets (Global)</option>` + 
+        state.sheets.map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join("");
+      sheetFilter.value = selectedSheet;
+    }
+    
+    const params = new URLSearchParams({
+      year,
+      type: scopeType,
+    });
+    if (selectedSheet) {
+      params.append("sheet", selectedSheet);
+    }
+    
+    const rows = await api(`/api/yearly_plan?` + params.toString());
     
     const metaEl = document.getElementById("yearlyMeta");
     if (metaEl) {
-      metaEl.textContent = `${rows.length} asset(s) scheduled for inspection in ${year}`;
+      const scopeLabel = scopeType === "all" ? "All Scopes" : (scopeType === "internal" ? "Internal (Shutdown) Only" : "OSI (On-Stream) Only");
+      const sheetLabel = selectedSheet ? `Sheet: ${selectedSheet}` : "All Sheets (Global)";
+      metaEl.textContent = `${rows.length} inspection event(s) scheduled for ${year} (${sheetLabel} · ${scopeLabel})`;
     }
     
     const el = document.getElementById("yearlyTableWrap");
@@ -1448,6 +1591,477 @@ async function createAsset() {
   } catch (err) {
     showToast("Failed to create asset: " + err.message, true);
   }
+}
+
+// ---------------------------------------------------------------- Campaign Reconciliation
+state.reconFilter = "all";
+state.reconSearch = "";
+state.reconCategory = "";
+
+function renderVariancePill(days) {
+  if (days === null || days === undefined) {
+    return `<span class="variance-pill" style="background:rgba(255,255,255,0.05); color:var(--text-faint);">No Due Date</span>`;
+  }
+  if (Math.abs(days) <= 60) {
+    return `<span class="variance-pill ok" title="Aligned with Master statutory date within 60 days">🟢 ALIGNED (${days > 0 ? '+' : ''}${days}d)</span>`;
+  }
+  if (days > 60) {
+    return `<span class="variance-pill late" title="Planned later than Master statutory date by ${days} days">🔴 LATE +${days}d</span>`;
+  }
+  return `<span class="variance-pill ahead" title="Planned ahead of Master statutory date by ${Math.abs(days)} days">🟣 AHEAD ${days}d</span>`;
+}
+
+function renderProgressBadge(val) {
+  const v = (val || "").trim();
+  if (!v) return `<span class="badge-progress" style="background:rgba(255,255,255,0.05); color:var(--text-faint);">—</span>`;
+  const lower = v.toLowerCase();
+  if (lower === "done") {
+    return `<span class="badge-progress done">✅ DONE</span>`;
+  }
+  if (lower === "holding") {
+    return `<span class="badge-progress holding">⏳ HOLDING</span>`;
+  }
+  if (lower.includes("survice") || lower.includes("service") || lower.includes("oos")) {
+    return `<span class="badge-progress oos">OUT OF SERVICE</span>`;
+  }
+  return `<span class="badge-progress" style="background:rgba(0,210,255,0.12); color:var(--accent);">${esc(v)}</span>`;
+}
+const formatUtProgressBadge = renderProgressBadge;
+
+window.setReconFilter = function(filterName) {
+  state.reconFilter = filterName;
+  document.querySelectorAll(".subnav-btn[data-recon-filter]").forEach(b => {
+    b.classList.toggle("active", b.dataset.reconFilter === filterName);
+  });
+  loadReconciliationItems();
+};
+
+async function loadReconciliation() {
+  try {
+    const stats = await api("/api/reconciliation");
+    
+    // Update Header KPIs
+    const matchEl = document.getElementById("kpiReconMatchRate");
+    if (matchEl) matchEl.textContent = `${stats.match_rate}%`;
+    const utEl = document.getElementById("kpiReconUtRate");
+    if (utEl) utEl.textContent = `${stats.progress_stats?.ut_percent || 0}%`;
+
+    // Update Cards
+    const totEl = document.getElementById("reconTotalItems");
+    if (totEl) totEl.textContent = stats.total_items;
+    const matEl = document.getElementById("reconMatchedItems");
+    if (matEl) matEl.textContent = `${stats.matched_count} (${stats.match_rate}%)`;
+    const varEl = document.getElementById("reconVariances");
+    if (varEl) varEl.textContent = `${stats.variance_count} (${stats.delayed_count} Late)`;
+    const omiEl = document.getElementById("reconOmissions");
+    if (omiEl) omiEl.textContent = stats.omitted_overdue_count;
+    const unmEl = document.getElementById("reconUnmatched");
+    if (unmEl) unmEl.textContent = stats.unmatched_count;
+
+    // Update Subnav Count Badges
+    const subAll = document.getElementById("countSubAll"); if (subAll) subAll.textContent = stats.total_items;
+    const subVar = document.getElementById("countSubVariances"); if (subVar) subVar.textContent = stats.variance_count;
+    const subOmi = document.getElementById("countSubOmissions"); if (subOmi) subOmi.textContent = stats.omitted_overdue_count;
+    const subDone = document.getElementById("countSubDone"); if (subDone) subDone.textContent = stats.progress_stats?.ut_done || 0;
+    const subHold = document.getElementById("countSubHolding"); if (subHold) subHold.textContent = stats.progress_stats?.ut_holding || 0;
+    const subUnm = document.getElementById("countSubUnmatched"); if (subUnm) subUnm.textContent = stats.unmatched_count;
+
+    // Update Bulk Sync Master Button
+    const btnSync = document.getElementById("btnBulkSyncMaster");
+    if (btnSync) {
+      const pending = stats.pending_sync_count ?? 0;
+      const synced = stats.synced_count ?? 0;
+      if (pending > 0) {
+        btnSync.innerHTML = `⚡ Sync Completed to Master (${pending} Pending)`;
+        btnSync.disabled = false;
+        btnSync.style.opacity = "1";
+        btnSync.style.cursor = "pointer";
+      } else if (synced > 0) {
+        btnSync.innerHTML = `✅ Master Synchronized (${synced} Assets)`;
+        btnSync.disabled = true;
+        btnSync.style.opacity = "0.75";
+        btnSync.style.cursor = "default";
+      } else {
+        btnSync.innerHTML = `⚡ Sync Completed to Master (0)`;
+        btnSync.disabled = true;
+        btnSync.style.opacity = "0.6";
+        btnSync.style.cursor = "not-allowed";
+      }
+    }
+
+    loadReconciliationItems();
+  } catch (err) {
+    showToast("Failed to load reconciliation stats: " + err.message, true);
+  }
+}
+
+async function loadReconciliationItems() {
+  const wrap = document.getElementById("reconciliationTableWrap");
+  if (!wrap) return;
+
+  try {
+    const metaText = document.getElementById("reconMetaText");
+    const q = document.getElementById("reconSearchBox")?.value?.trim() || "";
+    const cat = document.getElementById("reconCategoryFilter")?.value || "";
+
+    if (state.reconFilter === "omissions") {
+      // Load Master Overdue Assets Omitted from Campaign
+      const omissions = await api("/api/reconciliation/omissions" + (q ? `?q=${encodeURIComponent(q)}` : ""));
+      if (metaText) metaText.textContent = `${omissions.length} overdue/high-risk master asset(s) not covered in campaign${q ? ` (matching "${q}")` : ""}`;
+      wrap.innerHTML = renderOmissionsTable(omissions);
+      bindRowClicks(wrap);
+      return;
+    }
+
+    const params = new URLSearchParams({
+      filter: state.reconFilter,
+      q: q,
+      category: cat,
+    });
+
+    const items = await api("/api/refined_plan?" + params.toString());
+    
+    // Populate categories in filter if empty
+    const catSelect = document.getElementById("reconCategoryFilter");
+    if (catSelect && catSelect.options.length <= 1 && items.length) {
+      const cats = Array.from(new Set(items.map(it => it.category).filter(Boolean))).sort();
+      cats.forEach(c => {
+        const opt = document.createElement("option");
+        opt.value = c;
+        opt.textContent = c;
+        catSelect.appendChild(opt);
+      });
+      catSelect.value = cat;
+    }
+
+    if (metaText) {
+      metaText.textContent = `Showing ${items.length} item(s)${q ? ` matching "${q}"` : ""}${cat ? ` in ${cat}` : ""}`;
+    }
+
+    wrap.innerHTML = renderReconciliationTable(items);
+    
+    // Bind click to open Asset Drawer for matched master assets
+    wrap.querySelectorAll("tr[data-asset-id]").forEach(tr => {
+      const aid = tr.dataset.assetId;
+      if (aid) {
+        tr.addEventListener("click", () => openAssetDrawer(parseInt(aid)));
+      }
+    });
+
+  } catch (err) {
+    showToast("Failed to load campaign reconciliation: " + err.message, true);
+  }
+}
+
+window.clearReconCategory = function() {
+  const catSelect = document.getElementById("reconCategoryFilter");
+  if (catSelect) catSelect.value = "";
+  loadReconciliationItems();
+};
+
+function renderReconciliationTable(rows) {
+  if (!rows || !rows.length) {
+    const q = document.getElementById("reconSearchBox")?.value?.trim() || "";
+    const cat = document.getElementById("reconCategoryFilter")?.value || "";
+    const filter = state.reconFilter;
+    let hint = "";
+    if (q) {
+      if (cat) {
+        hint += ` <button class="btn ghost small" style="margin-left:8px;" onclick="clearReconCategory()">Clear Category Filter</button>`;
+      }
+      if (filter && filter !== "all") {
+        hint += ` <button class="btn ghost small" style="margin-left:8px;" onclick="setReconFilter('all')">Search All Campaign Items</button>`;
+      }
+      return `<table class="assets"><tbody><tr class="empty-row"><td>No campaign items found matching "<strong>${esc(q)}</strong>".${hint}</td></tr></tbody></table>`;
+    }
+    return `<table class="assets"><tbody><tr class="empty-row"><td>No campaign items found matching this filter.</td></tr></tbody></table>`;
+  }
+
+  return `<table class="assets">
+    <thead>
+      <tr>
+        <th>Campaign Item / Package</th>
+        <th>Matched Master Asset</th>
+        <th>Campaign Planned Date</th>
+        <th>Master Statutory Due</th>
+        <th>Variance</th>
+        <th>Scope</th>
+        <th>UT / Report Progress</th>
+        <th>Scope & Recommendations</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows.map(r => {
+        const hasMatch = r.match_status === "MATCHED" && r.asset_id;
+        const rowClass = hasMatch ? "recon-row-matched clickable-row" : "recon-row-unmatched";
+        const isLate = r.date_variance_days && r.date_variance_days > 60;
+        const isEarly = r.date_variance_days && r.date_variance_days < -60;
+        
+        let varBadge = `<span class="badge-variance on-time">ON SCHEDULE</span>`;
+        if (isLate) {
+          varBadge = `<span class="badge-variance delayed" title="Delayed by ${r.date_variance_days} days after statutory due date">⚠️ ${r.date_variance_days}d LATE</span>`;
+        } else if (isEarly) {
+          varBadge = `<span class="badge-variance proactive" title="Executing ${Math.abs(r.date_variance_days)} days ahead of statutory due date">🛡️ ${Math.abs(r.date_variance_days)}d EARLY</span>`;
+        } else if (r.date_variance_days !== null && r.date_variance_days !== undefined) {
+          varBadge = `<span class="badge-variance on-time">${r.date_variance_days >= 0 ? '+' : ''}${r.date_variance_days}d</span>`;
+        }
+
+        return `
+        <tr class="${rowClass}" ${hasMatch ? `data-asset-id="${r.asset_id}"` : ''}>
+          <td>
+            <div style="font-weight:700; color:#fff;">${esc(r.extracted_tag || r.pkg_or_asset_no || '—')}</div>
+            <div style="font-size:11.5px; color:var(--text-muted); line-height:1.35; margin-top:2px;">${esc(r.item_description || '—')}</div>
+            <div style="margin-top:4px;">
+              <span class="tag-mono" style="font-size:10px;">${esc(r.category || 'Package')}</span>
+              ${r.pkg_or_asset_no && r.pkg_or_asset_no !== r.extracted_tag ? `<span class="tag-mono" style="font-size:10px; margin-left:4px;">Pkg: ${esc(r.pkg_or_asset_no)}</span>` : ''}
+            </div>
+          </td>
+          <td>
+            ${hasMatch ? `
+              <div style="font-weight:600; color:var(--accent);">
+                ${esc(r.master_name || 'Master Asset')}
+              </div>
+              <div class="tag-mono" style="color:#a5d6a7; margin-top:2px;">
+                Tag: ${esc(r.master_tag || '—')} | Sheet: ${esc(r.master_source_sheet || '—')}
+              </div>
+              <div style="display:flex; gap:6px; margin-top:4px; align-items:center;">
+                <span class="badge-pill-verified" title="Reconciled to master statutory asset">✓ MATCHED</span>
+                ${r.master_risk ? `<span class="risk-badge risk-${r.master_risk.toLowerCase()}">${esc(r.master_risk)}</span>` : ''}
+                ${r.master_location ? `<span class="tag-mono" style="font-size:10px; color:var(--text-muted);">Loc: ${esc(r.master_location)}</span>` : ''}
+              </div>
+            ` : `
+              <div style="color:var(--text-muted); font-style:italic;">No baseline asset matched</div>
+              <div style="margin-top:4px;">
+                <span class="badge-pill-unmatched" title="Item present in campaign but not mapped to master statutory asset">UNMATCHED IN MASTER</span>
+              </div>
+            `}
+          </td>
+          <td>
+            <div style="font-family:var(--font-mono); font-weight:600; color:#fff;">
+              ${fmtDate(r.planned_insp_date)}
+            </div>
+            ${r.last_insp_date ? `<div style="font-size:10.5px; color:var(--text-muted);">Last: ${fmtDate(r.last_insp_date)}</div>` : ''}
+          </td>
+          <td>
+            ${hasMatch ? `
+              <div style="font-family:var(--font-mono); font-size:12px; font-weight:600; color:${r.master_internal_next ? '#bb86fc' : '#00d2ff'};">
+                ${fmtDate(r.master_internal_next || r.master_osi_next)}
+              </div>
+              <div style="font-size:10.5px; color:var(--text-muted);">
+                ${r.master_internal_next ? 'Statutory Internal' : 'Statutory OSI'}
+              </div>
+            ` : `<span style="color:var(--text-muted);">—</span>`}
+          </td>
+          <td>${hasMatch ? varBadge : '<span style="color:var(--text-muted);">—</span>'}</td>
+          <td>
+            <span class="badge-scope">${esc(r.scope_category || 'General')}</span>
+            ${r.priority ? `<div style="font-size:10.5px; margin-top:3px; color:var(--text-muted);">Pri: ${esc(r.priority)}</div>` : ''}
+          </td>
+          <td>
+            <div>${renderProgressBadge(r.ut_progress)}</div>
+            ${r.report_issued && r.report_issued !== r.ut_progress ? `
+              <div style="margin-top:4px; font-size:11px; color:var(--text-muted);">
+                Report: ${renderProgressBadge(r.report_issued)}
+              </div>
+            ` : ''}
+            ${r.synced_to_master ? `<div style="margin-top:4px;"><span class="badge-progress" style="background:rgba(0,230,118,0.18); color:#00e676; border:1px solid rgba(0,230,118,0.4); font-weight:700; font-size:10px;">✅ Master Synced</span></div>` : ""}
+          </td>
+          <td>
+            <div style="font-size:11.5px; color:var(--text-muted); line-height:1.4; max-width:280px;">
+              ${esc(r.insp_scope_remarks || r.remarks || r.master_remarks || '—')}
+            </div>
+          </td>
+        </tr>`;
+      }).join("")}
+    </tbody>
+  </table>`;
+}
+
+function renderOmissionsTable(rows) {
+  if (!rows || !rows.length) {
+    const q = document.getElementById("reconSearchBox")?.value?.trim() || "";
+    if (q) {
+      return `<table class="assets"><tbody><tr class="empty-row"><td>No omitted overdue assets found matching "<strong>${esc(q)}</strong>".</td></tr></tbody></table>`;
+    }
+    return `<table class="assets"><tbody><tr class="empty-row"><td>Zero omissions! All overdue master assets are accounted for in the campaign.</td></tr></tbody></table>`;
+  }
+
+  return `<table class="assets">
+    <thead>
+      <tr>
+        <th>Omitted Master Asset</th>
+        <th>System / Sheet</th>
+        <th>Field / Location</th>
+        <th>Statutory Due Date</th>
+        <th>Compliance Status</th>
+        <th>Remarks</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${rows.map(a => `
+        <tr data-id="${a.id}">
+          <td>
+            <div style="font-weight:600; color:#fff;">${esc(a.name || '—')} ${riskBadge(a)}</div>
+            <div class="tag-mono">${esc(a.tag || a.sn || '—')}</div>
+          </td>
+          <td><span class="tag-mono" style="color:var(--accent); font-weight:600;">${esc(a.source_sheet || '—')}</span></td>
+          <td><span class="tag-mono">${esc(a.plant || a.field || a.location || '—')}</span></td>
+          <td>
+            <div style="font-family:var(--font-mono); font-size:12px; color:var(--danger);">${fmtDate(a.next_due)}</div>
+            ${a.date_internal_next ? `<div style="font-size:10.5px; color:#bb86fc;">Internal: ${fmtDate(a.date_internal_next)}</div>` : ''}
+          </td>
+          <td>${statusPill(a)}</td>
+          <td><div style="max-width:260px; font-size:11.5px; color:var(--text-muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${esc(a.remarks || '')}">${esc(a.remarks || '—')}</div></td>
+        </tr>
+      `).join("")}
+    </tbody>
+  </table>`;
+}
+
+// Reconciliation Toolbar Listeners
+let reconSearchDebounce = null;
+const reconSearchBox = document.getElementById("reconSearchBox");
+if (reconSearchBox) {
+  reconSearchBox.addEventListener("input", () => {
+    clearTimeout(reconSearchDebounce);
+    reconSearchDebounce = setTimeout(loadReconciliationItems, 160);
+  });
+  reconSearchBox.addEventListener("search", () => {
+    clearTimeout(reconSearchDebounce);
+    loadReconciliationItems();
+  });
+  reconSearchBox.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      clearTimeout(reconSearchDebounce);
+      loadReconciliationItems();
+    }
+  });
+}
+document.getElementById("reconCategoryFilter")?.addEventListener("change", loadReconciliationItems);
+document.getElementById("btnReloadRecon")?.addEventListener("click", loadReconciliation);
+document.getElementById("btnExportRecon")?.addEventListener("click", () => {
+  const cat = document.getElementById("reconCategoryFilter")?.value || "";
+  const q = document.getElementById("reconSearchBox")?.value?.trim() || "";
+  const params = new URLSearchParams({
+    filter: state.reconFilter,
+    category: cat,
+    q: q,
+  });
+  window.location.href = "/api/reconciliation/export.csv?" + params.toString();
+});
+
+// Refined Plan Import Handler
+const btnImportRefined = document.getElementById("btnImportRefined");
+const refinedFileInput = document.getElementById("refinedFileInput");
+if (btnImportRefined && refinedFileInput) {
+  btnImportRefined.addEventListener("click", () => {
+    refinedFileInput.value = "";
+    refinedFileInput.click();
+  });
+
+  refinedFileInput.addEventListener("change", async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const origText = btnImportRefined.innerHTML;
+    btnImportRefined.disabled = true;
+    btnImportRefined.innerHTML = "⏳ Importing…";
+
+    try {
+      const reader = new FileReader();
+      reader.onload = async (ev) => {
+        try {
+          const base64Data = ev.target.result.split(",")[1];
+          const res = await api("/api/reconciliation/import", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              filename: file.name,
+              filedata: base64Data,
+            }),
+          });
+          showToast(res.message || "Refined plan imported successfully!", false);
+          loadReconciliation();
+        } catch (err) {
+          showToast("Import failed: " + err.message, true);
+        } finally {
+          btnImportRefined.disabled = false;
+          btnImportRefined.innerHTML = origText;
+        }
+      };
+      reader.onerror = () => {
+        showToast("Failed to read file.", true);
+        btnImportRefined.disabled = false;
+        btnImportRefined.innerHTML = origText;
+      };
+      reader.readAsDataURL(file);
+    } catch (err) {
+      showToast("Error processing file: " + err.message, true);
+      btnImportRefined.disabled = false;
+      btnImportRefined.innerHTML = origText;
+    }
+  });
+}
+
+// Bulk Synchronize Completed Inspections to Master Plan
+const btnBulkSyncMaster = document.getElementById("btnBulkSyncMaster");
+if (btnBulkSyncMaster) {
+  btnBulkSyncMaster.addEventListener("click", async () => {
+    const confirmMsg = "⚡ Bulk Synchronize Completed Inspections to Master Plan\n\n" +
+      "This action will:\n" +
+      "1. Log official inspection records in the Master Plan for all campaign items marked as 'Done'.\n" +
+      "2. Advance their next statutory due dates (OSI / Internal).\n" +
+      "3. Officially clear their Overdue status across all dashboard metrics and reports.\n" +
+      "4. Create an automatic backup of the database beforehand.\n\n" +
+      "Do you wish to proceed?";
+
+    if (!confirm(confirmMsg)) return;
+
+    const origText = btnBulkSyncMaster.innerHTML;
+    btnBulkSyncMaster.disabled = true;
+    btnBulkSyncMaster.innerHTML = "⏳ Synchronizing…";
+
+    try {
+      const res = await api("/api/reconciliation/sync_completed", { method: "POST" });
+      showToast(res.message || "Inspections synchronized successfully!", false);
+      loadReconciliation();
+      loadDashboard();
+      if (state.view === "assets") loadAssets();
+    } catch (err) {
+      showToast("Sync failed: " + err.message, true);
+    } finally {
+      btnBulkSyncMaster.disabled = false;
+      btnBulkSyncMaster.innerHTML = origText;
+    }
+  });
+}
+
+// Clear Reconciled Campaign Data Handler
+const btnClearRecon = document.getElementById("btnClearRecon");
+if (btnClearRecon) {
+  btnClearRecon.addEventListener("click", async () => {
+    const confirmMsg = "Are you sure you want to clear all reconciled campaign data?\n\n" +
+      "This will remove the campaign spreadsheet data and restore the view to its initial empty state.\n" +
+      "Your Master Plan assets and statutory records will NOT be deleted.\n\n" +
+      "Clear reconciled campaign?";
+
+    if (!confirm(confirmMsg)) return;
+
+    const origText = btnClearRecon.innerHTML;
+    btnClearRecon.disabled = true;
+    btnClearRecon.innerHTML = "⏳ Clearing…";
+
+    try {
+      const res = await api("/api/reconciliation/clear", { method: "POST" });
+      showToast(res.message || "Reconciled campaign data cleared cleanly.", false);
+      loadReconciliation();
+    } catch (err) {
+      showToast("Failed to clear campaign: " + err.message, true);
+    } finally {
+      btnClearRecon.disabled = false;
+      btnClearRecon.innerHTML = origText;
+    }
+  });
 }
 
 // ---------------------------------------------------------------- Initialization

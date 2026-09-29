@@ -52,7 +52,10 @@ def get_conn():
         ("damage_mechanisms", "TEXT"), ("cui_susceptible", "INTEGER"),
         ("deferral_status", "TEXT"), ("deferral_reason", "TEXT"), ("deferral_mitigation", "TEXT"),
         ("deferral_expiry", "TEXT"), ("deferral_approver", "TEXT"), ("deferral_moc_no", "TEXT"),
-        ("pof_score", "INTEGER"), ("cof_score", "INTEGER")
+        ("pof_score", "INTEGER"), ("cof_score", "INTEGER"),
+        ("date_osi_last_raw", "TEXT"), ("date_osi_next_raw", "TEXT"),
+        ("date_internal_last_raw", "TEXT"), ("date_internal_next_raw", "TEXT"),
+        ("status_osi_next", "TEXT"), ("status_internal_next", "TEXT")
     ]
     for col_name, col_type in new_cols:
         if col_name not in asset_cols:
@@ -60,6 +63,31 @@ def get_conn():
                 cur.execute(f"ALTER TABLE assets ADD COLUMN {col_name} {col_type}")
             except Exception:
                 pass
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS refined_plan_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        asset_id INTEGER REFERENCES assets(id) ON DELETE SET NULL,
+        category TEXT,
+        pkg_or_asset_no TEXT,
+        item_description TEXT,
+        extracted_tag TEXT,
+        last_insp_date TEXT,
+        planned_insp_date TEXT,
+        scope_category TEXT,
+        priority TEXT,
+        insp_scope_remarks TEXT,
+        ut_progress TEXT,
+        report_issued TEXT,
+        api_eval_done TEXT,
+        kpc_updated TEXT,
+        kpc_sent TEXT,
+        remarks TEXT,
+        match_status TEXT,
+        match_method TEXT,
+        date_variance_days INTEGER,
+        created_at TEXT DEFAULT (datetime('now'))
+    );
+    """)
     conn.commit()
     return conn
 
@@ -71,7 +99,11 @@ ASSET_COLUMNS = frozenset([
     "source_sheet", "sn", "field", "plant", "location", "unit_name", "name",
     "tag", "asset_number", "description", "in_service", "insulation",
     "last_insp_category", "date_osi_last", "date_osi_next",
-    "date_internal_last", "date_internal_next", "next_insp_category",
+    "date_internal_last", "date_internal_next",
+    "date_osi_last_raw", "date_osi_next_raw",
+    "date_internal_last_raw", "date_internal_next_raw",
+    "status_osi_next", "status_internal_next",
+    "next_insp_category",
     "corrosion_rate", "remaining_life",
     "fluid_service", "design_pressure", "design_temp", "operating_pressure",
     "operating_temp", "material_spec", "nominal_thickness", "t_min",
@@ -173,30 +205,72 @@ def row_to_dict(row):
         else:
             d["is_cui"] = False
 
-    # Earliest upcoming/overdue date
-    due_candidates = [d.get("date_osi_next"), d.get("date_internal_next")]
-    due_candidates = [x for x in due_candidates if x]
-    d["next_due"] = min(due_candidates) if due_candidates else None
-    
-    # Overdue & Aging calculation
-    if d["next_due"]:
-        d["overdue"] = d["next_due"] < today()
-        if d["overdue"]:
-            try:
-                days = (datetime.date.today() - datetime.date.fromisoformat(d["next_due"])).days
-                d["days_overdue"] = days
-                if days <= 30: d["aging_bucket"] = "0_30"
-                elif days <= 90: d["aging_bucket"] = "31_90"
-                elif days <= 180: d["aging_bucket"] = "91_180"
-                else: d["aging_bucket"] = "180_plus"
-            except Exception:
-                d["days_overdue"] = 0
-                d["aging_bucket"] = "0_30"
-        else:
-            d["days_overdue"] = 0
-            d["aging_bucket"] = "current"
+    # Earliest upcoming/overdue date & inspection types
+    t_today = today()
+    osi_n = d.get("date_osi_next")
+    int_n = d.get("date_internal_next")
+    status_osi_n = str(d.get("status_osi_next") or "").strip()
+    status_int_n = str(d.get("status_internal_next") or "").strip()
+
+    # Individual overdue flags:
+    d["osi_overdue"] = bool((osi_n and osi_n < t_today) or (status_osi_n.lower() == "overdue" and not (osi_n and osi_n >= t_today)))
+    d["internal_overdue"] = bool((int_n and int_n < t_today) or (status_int_n.lower() == "overdue" and not (int_n and int_n >= t_today)))
+    d["overdue"] = d["osi_overdue"] or d["internal_overdue"]
+    d["is_overdue"] = d["overdue"]
+
+    if d["osi_overdue"] and d["internal_overdue"]:
+        d["overdue_type"] = "Both"
+    elif d["internal_overdue"]:
+        d["overdue_type"] = "Internal"
+    elif d["osi_overdue"]:
+        d["overdue_type"] = "OSI"
     else:
-        d["overdue"] = False
+        d["overdue_type"] = None
+
+    # Operational status flags:
+    d["is_next_sd"] = bool(
+        "next sd" in status_int_n.lower() or "next sd" in status_osi_n.lower() or
+        "nsd" in status_int_n.lower() or "nsd" in status_osi_n.lower()
+    )
+    d["is_waiting_eval"] = bool(
+        "w/eval" in status_int_n.lower() or "w/eval" in status_osi_n.lower() or
+        "waiting eval" in status_int_n.lower() or "waiting eval" in status_osi_n.lower()
+    )
+
+    # Earliest upcoming/overdue date and inspection type:
+    due_candidates = []
+    if osi_n:
+        due_candidates.append((osi_n, "OSI"))
+    if int_n:
+        due_candidates.append((int_n, "Internal"))
+
+    if due_candidates:
+        due_candidates.sort() # earliest first
+        d["next_due"] = due_candidates[0][0]
+        if len(due_candidates) == 2 and due_candidates[0][0] == due_candidates[1][0]:
+            d["next_due_type"] = "Both"
+        else:
+            d["next_due_type"] = due_candidates[0][1]
+    else:
+        d["next_due"] = None
+        d["next_due_type"] = None
+
+    # Overdue & Aging calculation
+    if d["overdue"] and d["next_due"]:
+        try:
+            days = (datetime.date.today() - datetime.date.fromisoformat(d["next_due"])).days
+            d["days_overdue"] = max(0, days)
+            if days <= 30: d["aging_bucket"] = "0_30"
+            elif days <= 90: d["aging_bucket"] = "31_90"
+            elif days <= 180: d["aging_bucket"] = "91_180"
+            else: d["aging_bucket"] = "180_plus"
+        except Exception:
+            d["days_overdue"] = 0
+            d["aging_bucket"] = "0_30"
+    elif d["next_due"]:
+        d["days_overdue"] = 0
+        d["aging_bucket"] = "current"
+    else:
         d["days_overdue"] = 0
         d["aging_bucket"] = "no_date"
 
@@ -229,6 +303,8 @@ def api_list_assets(params):
     q = params.get("q", [""])[0].strip()
     sheet = params.get("sheet", [""])[0].strip()
     overdue_only = params.get("overdue", ["0"])[0] == "1"
+    overdue_type_filter = params.get("overdue_type", [""])[0].strip().lower()
+    status_filter = params.get("status", [""])[0].strip().lower()
     include_archived = params.get("archived", ["0"])[0] == "1"
     risk_filter = params.get("risk", [""])[0].strip().upper()
     aging_filter = params.get("aging", [""])[0].strip()
@@ -241,16 +317,31 @@ def api_list_assets(params):
     if q:
         tokens = [t for t in re.findall(r"[\w]+", q) if t]
         if tokens:
-            fts_query = " ".join([f'"{t}"*' for t in tokens])
+            fts_parts = []
+            for t in tokens:
+                t_low = t.lower()
+                if t_low in ("compressor", "compressors", "compress", "comp", "com"):
+                    fts_parts.append('("compressor"* OR "compress"* OR "comp"* OR "com"*)')
+                elif t_low in ("turbine", "turbines", "turb"):
+                    fts_parts.append('("turbine"* OR "turb"*)')
+                elif t_low in ("generator", "generators", "gen"):
+                    fts_parts.append('("generator"* OR "gen"*)')
+                else:
+                    fts_parts.append(f'"{t}"*')
+            fts_query = " AND ".join(fts_parts)
             try:
                 sql = "SELECT * FROM assets WHERE id IN (SELECT rowid FROM assets_fts WHERE assets_fts MATCH ?) "
                 args.append(fts_query)
             except Exception:
-                sql = "SELECT * FROM assets WHERE (name LIKE ? OR tag LIKE ? OR asset_number LIKE ? OR remarks LIKE ? OR fluid_service LIKE ? OR field LIKE ?) "
-                args = [f"%{q}%"] * 6
+                search_cols = ["name", "tag", "asset_number", "description", "remarks", "fluid_service", "field", "unit_name", "plant", "location"]
+                clauses = " OR ".join([f"{c} LIKE ?" for c in search_cols])
+                sql = f"SELECT * FROM assets WHERE ({clauses}) "
+                args = [f"%{q}%"] * len(search_cols)
         else:
-            sql = "SELECT * FROM assets WHERE (name LIKE ? OR tag LIKE ? OR asset_number LIKE ? OR remarks LIKE ?) "
-            args = [f"%{q}%"] * 4
+            search_cols = ["name", "tag", "asset_number", "description", "remarks", "fluid_service", "field", "unit_name", "plant", "location"]
+            clauses = " OR ".join([f"{c} LIKE ?" for c in search_cols])
+            sql = f"SELECT * FROM assets WHERE ({clauses}) "
+            args = [f"%{q}%"] * len(search_cols)
 
     if not include_archived:
         sql += " AND archived = 0"
@@ -262,19 +353,33 @@ def api_list_assets(params):
         try:
             raw_rows = CONN.execute(sql, args).fetchall()
         except sqlite3.OperationalError:
-            sql_fallback = "SELECT * FROM assets WHERE (name LIKE ? OR tag LIKE ? OR asset_number LIKE ? OR remarks LIKE ?) "
+            search_cols = ["name", "tag", "asset_number", "description", "remarks", "fluid_service", "field", "unit_name", "plant", "location"]
+            clauses = " OR ".join([f"{c} LIKE ?" for c in search_cols])
+            sql_fallback = f"SELECT * FROM assets WHERE ({clauses}) "
             if not include_archived:
                 sql_fallback += " AND archived = 0"
             if sheet:
                 sql_fallback += " AND source_sheet = ?"
-                raw_rows = CONN.execute(sql_fallback, [f"%{q}%"] * 4 + [sheet]).fetchall()
+                raw_rows = CONN.execute(sql_fallback, [f"%{q}%"] * len(search_cols) + [sheet]).fetchall()
             else:
-                raw_rows = CONN.execute(sql_fallback, [f"%{q}%"] * 4).fetchall()
+                raw_rows = CONN.execute(sql_fallback, [f"%{q}%"] * len(search_cols)).fetchall()
 
         rows = [row_to_dict(r) for r in raw_rows]
 
     if overdue_only:
         rows = [r for r in rows if r["overdue"]]
+    if overdue_type_filter:
+        if overdue_type_filter == "internal":
+            rows = [r for r in rows if r["internal_overdue"]]
+        elif overdue_type_filter == "osi":
+            rows = [r for r in rows if r["osi_overdue"]]
+        elif overdue_type_filter == "both":
+            rows = [r for r in rows if r["internal_overdue"] and r["osi_overdue"]]
+    if status_filter:
+        if status_filter in ("next_sd", "sd"):
+            rows = [r for r in rows if r.get("is_next_sd")]
+        elif status_filter in ("w_eval", "eval"):
+            rows = [r for r in rows if r.get("is_waiting_eval")]
     if risk_filter in ("HIGH", "MEDIUM", "LOW"):
         rows = [r for r in rows if r["risk_category"] == risk_filter]
     if aging_filter:
@@ -303,6 +408,10 @@ def api_dashboard():
             "SELECT * FROM critical_assets ORDER BY id ASC").fetchall()]
 
     overdue = [r for r in rows if r["overdue"]]
+    overdue_internal = [r for r in rows if r["internal_overdue"]]
+    overdue_osi = [r for r in rows if r["osi_overdue"]]
+    next_sd_assets = [r for r in rows if r.get("is_next_sd")]
+    w_eval_assets = [r for r in rows if r.get("is_waiting_eval")]
     high_risk = [r for r in rows if r["risk_category"] == "HIGH"]
     cui_flagged = [r for r in rows if r.get("is_cui")]
     expired_repairs = [tr for tr in temp_repairs if (tr.get("expiration_status") or "").lower() == "expired" or (tr.get("expiration_date") and tr.get("expiration_date") < today())]
@@ -358,6 +467,10 @@ def api_dashboard():
         "total_assets": len(rows),
         "compliance_rate": compliance_rate,
         "overdue_count": len(overdue),
+        "overdue_internal_count": len(overdue_internal),
+        "overdue_osi_count": len(overdue_osi),
+        "next_sd_count": len(next_sd_assets),
+        "w_eval_count": len(w_eval_assets),
         "high_risk_count": len(high_risk),
         "cui_count": len(cui_flagged),
         "temp_repairs_count": len(temp_repairs),
@@ -467,7 +580,9 @@ def api_bulk_log(payload):
             updates = [f"{last_field} = ?"]
             params = [insp_date]
             if next_due:
+                status_field = "status_osi_next" if is_osi else "status_internal_next"
                 updates.append(f"{next_field} = ?")
+                updates.append(f"{status_field} = 'Scheduled'")
                 params.append(next_due)
             params.append(aid)
             CONN.execute(f"UPDATE assets SET {', '.join(updates)} WHERE id = ?", params)
@@ -522,6 +637,10 @@ def api_clear_database():
         CONN.execute("DELETE FROM inspection_log")
         CONN.execute("DELETE FROM raw_rows")
         try:
+            CONN.execute("DELETE FROM refined_plan_items")
+        except Exception:
+            pass
+        try:
             CONN.execute("DELETE FROM assets_fts")
         except Exception:
             pass
@@ -529,6 +648,140 @@ def api_clear_database():
     return {
         "success": True,
         "message": f"Database wiped clean (0 records remaining). Backup saved as: {os.path.basename(backup) if backup else 'N/A'}",
+        "backup_file": backup
+    }
+
+
+def api_clear_reconciliation():
+    """Clear all records from refined_plan_items to restore the original view."""
+    with CONN_LOCK:
+        try:
+            CONN.execute("DELETE FROM refined_plan_items")
+            CONN.commit()
+        except Exception as e:
+            pass
+    return {
+        "ok": True,
+        "message": "Reconciled campaign data cleared successfully. Original view restored."
+    }
+
+
+def api_sync_completed_to_master():
+    """
+    Bulk synchronize completed inspections from the reconciled campaign into the Master Plan.
+    Logs official inspection records in inspection_log, advances statutory inspection dates,
+    clears overdue status for equipment completed in the field, and updates refined_plan_items.
+    """
+    backup = _backup_db()
+    today_iso = datetime.date.today().isoformat()
+    synced_count = 0
+    updated_assets = set()
+
+    with CONN_LOCK:
+        # Ensure migration columns exist
+        try:
+            CONN.execute("ALTER TABLE refined_plan_items ADD COLUMN synced_to_master INTEGER DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            CONN.execute("ALTER TABLE refined_plan_items ADD COLUMN synced_at TEXT")
+        except Exception:
+            pass
+
+        items = CONN.execute("""
+            SELECT id, asset_id, pkg_or_asset_no, item_description,
+                   last_insp_date, planned_insp_date, scope_category,
+                   ut_progress, report_issued, remarks
+            FROM refined_plan_items
+            WHERE asset_id IS NOT NULL
+              AND (
+                LOWER(ut_progress) LIKE '%done%' OR 
+                LOWER(report_issued) LIKE '%done%' OR
+                LOWER(ut_progress) LIKE '%completed%'
+              )
+        """).fetchall()
+
+        for item in items:
+            item_id = item["id"]
+            asset_id = item["asset_id"]
+            scope_cat = (item["scope_category"] or "").upper()
+            is_internal = "INTERNAL" in scope_cat or "SD" in scope_cat
+            insp_type = "Internal" if is_internal else "OSI"
+
+            # The inspection that completed is the CAMPAIGN inspection!
+            # Use planned_insp_date if available (e.g. 2025-02-01), or today
+            insp_date = item["planned_insp_date"] or today_iso
+            try:
+                dt = datetime.date.fromisoformat(insp_date)
+            except Exception:
+                dt = datetime.date.today()
+                insp_date = dt.isoformat()
+
+            # Prevent duplicate logs for the same asset and date
+            existing = CONN.execute(
+                "SELECT id FROM inspection_log WHERE asset_id = ? AND insp_date = ?",
+                (asset_id, insp_date)
+            ).fetchone()
+
+            interval_years = 10 if is_internal else 5
+            try:
+                calc_next = dt.replace(year=dt.year + interval_years).isoformat()
+            except ValueError:
+                calc_next = (dt + datetime.timedelta(days=interval_years * 365)).isoformat()
+
+            if not existing:
+                findings = f"Campaign UT Inspection: Done. Report: {item['report_issued'] or 'Issued'}. Scope: {item['scope_category'] or 'UT/VT'}."
+                if item["remarks"]:
+                    findings += f" | {item['remarks']}"
+
+                CONN.execute("""
+                    INSERT INTO inspection_log (
+                        asset_id, insp_date, insp_type, findings,
+                        next_due_date, inspector_name, insp_method
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    asset_id, insp_date, insp_type, findings,
+                    calc_next, "Tactical Inspection Team", item["scope_category"] or "UT / VT"
+                ))
+
+            # Update asset statutory dates and advance next due date (officially clears overdue!)
+            if is_internal:
+                CONN.execute("""
+                    UPDATE assets 
+                    SET date_internal_last = ?, date_internal_next = ?, status_internal_next = 'Scheduled'
+                    WHERE id = ?
+                """, (insp_date, calc_next, asset_id))
+            else:
+                CONN.execute("""
+                    UPDATE assets 
+                    SET date_osi_last = ?, date_osi_next = ?, status_osi_next = 'Scheduled'
+                    WHERE id = ?
+                """, (insp_date, calc_next, asset_id))
+
+            # Mark campaign item as synced to master and recalculate variance days
+            try:
+                p_dt = datetime.date.fromisoformat(insp_date)
+                n_dt = datetime.date.fromisoformat(calc_next)
+                v_days = (p_dt - n_dt).days
+            except Exception:
+                v_days = 0
+
+            CONN.execute("""
+                UPDATE refined_plan_items
+                SET synced_to_master = 1, synced_at = datetime('now'), date_variance_days = ?
+                WHERE id = ?
+            """, (v_days, item_id))
+
+            synced_count += 1
+            updated_assets.add(asset_id)
+
+        CONN.commit()
+
+    return {
+        "ok": True,
+        "message": f"Successfully synchronized {synced_count} campaign inspections to Master Plan ({len(updated_assets)} assets updated). Statutory dates advanced and overdue statuses cleared.",
+        "synced_count": synced_count,
+        "assets_updated": len(updated_assets),
         "backup_file": backup
     }
 
@@ -625,14 +878,493 @@ def api_update_critical_asset(critical_id, payload):
 
 def api_yearly_plan(params):
     year = params.get("year", [str(datetime.date.today().year)])[0]
+    insp_type = params.get("type", ["all"])[0].strip().lower()
+    sheet = params.get("sheet", [""])[0].strip()
     start = f"{year}-01-01"
     end = f"{year}-12-31"
+
+    query = "SELECT * FROM assets WHERE archived = 0"
+    args = []
+    if sheet:
+        query += " AND source_sheet = ?"
+        args.append(sheet)
+
     with CONN_LOCK:
-        rows = [row_to_dict(r) for r in CONN.execute(
-            "SELECT * FROM assets WHERE archived = 0").fetchall()]
-    plan = [r for r in rows if r["next_due"] and start <= r["next_due"] <= end]
-    plan.sort(key=lambda r: r["next_due"])
+        rows = [row_to_dict(r) for r in CONN.execute(query, args).fetchall()]
+
+    plan = []
+    for r in rows:
+        int_n = r.get("date_internal_next")
+        osi_n = r.get("date_osi_next")
+
+        int_in_year = bool(int_n and start <= int_n <= end)
+        osi_in_year = bool(osi_n and start <= osi_n <= end)
+
+        if insp_type == "internal" and not int_in_year:
+            continue
+        if insp_type == "osi" and not osi_in_year:
+            continue
+        if not int_in_year and not osi_in_year:
+            continue
+
+        item = dict(r)
+        if int_in_year and osi_in_year:
+            item["plan_insp_type"] = "Both (Internal & OSI)"
+            item["plan_date"] = min(int_n, osi_n)
+        elif int_in_year:
+            item["plan_insp_type"] = "Internal"
+            item["plan_date"] = int_n
+        else:
+            item["plan_insp_type"] = "OSI"
+            item["plan_date"] = osi_n
+
+        plan.append(item)
+
+    plan.sort(key=lambda r: (r["plan_date"] or "", r.get("name") or ""))
     return plan
+
+
+def api_export_yearly_excel(params):
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    year = params.get("year", [str(datetime.date.today().year)])[0]
+    insp_type = params.get("type", ["all"])[0].strip().lower()
+    sheet = params.get("sheet", [""])[0].strip()
+
+    items = api_yearly_plan(params)
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"Plan {year}"
+    ws.views.sheetView[0].showGridLines = True
+
+    NAVY_HEADER = "0F172A"
+    WHITE = "FFFFFF"
+    BORDER_COLOR = "CBD5E1"
+    ZEBRA_FILL = "F8FAFC"
+
+    thin_border = Border(
+        left=Side(style="thin", color=BORDER_COLOR),
+        right=Side(style="thin", color=BORDER_COLOR),
+        top=Side(style="thin", color=BORDER_COLOR),
+        bottom=Side(style="thin", color=BORDER_COLOR)
+    )
+
+    # Title Block
+    ws.merge_cells("A1:N1")
+    ws["A1"] = f"STATUTORY INSPECTION PLAN — {year}"
+    ws["A1"].font = Font(name="Segoe UI", size=15, bold=True, color=WHITE)
+    ws["A1"].fill = PatternFill(start_color=NAVY_HEADER, end_color=NAVY_HEADER, fill_type="solid")
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 36
+
+    # Meta / Summary Block
+    scope_label = "All Inspection Scopes (Internal & OSI)" if insp_type == "all" else ("Internal (Shutdown) Only" if insp_type == "internal" else "OSI (On-Stream) Only")
+    sheet_label = sheet if sheet else "All Sheets (Global Asset Register)"
+    gen_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    total_count = len(items)
+    int_count = sum(1 for it in items if "Internal" in it.get("plan_insp_type", ""))
+    osi_count = sum(1 for it in items if "OSI" in it.get("plan_insp_type", ""))
+    high_count = sum(1 for it in items if it.get("risk_category") == "HIGH")
+
+    meta_lines = [
+        ("A2", f"Target Scope: {scope_label}  |  System / Sheet: {sheet_label}"),
+        ("A3", f"Generated: {gen_time}  |  Total Scheduled Assets: {total_count}  (Shutdown/Internal: {int_count} | On-Stream: {osi_count} | High Risk: {high_count})"),
+    ]
+    for cell_ref, text in meta_lines:
+        row_num = int(cell_ref[1:])
+        ws.merge_cells(f"A{row_num}:N{row_num}")
+        ws[cell_ref] = text
+        ws[cell_ref].font = Font(name="Segoe UI", size=10, italic=True, color="475569")
+        ws[cell_ref].alignment = Alignment(horizontal="left", vertical="center")
+        ws.row_dimensions[row_num].height = 18
+
+    # Empty spacer row
+    ws.row_dimensions[4].height = 10
+
+    # Header Row (Row 5)
+    headers = [
+        ("#", 6),
+        ("Scheduled Date", 16),
+        ("Inspection Scope", 22),
+        ("Asset Tag", 16),
+        ("Equipment Name", 38),
+        ("System / Sheet", 18),
+        ("Unit / Package", 22),
+        ("Location / Route", 24),
+        ("Operating Press.", 16),
+        ("Risk (API 580)", 14),
+        ("CUI Flag", 10),
+        ("Last OSI Date", 14),
+        ("Last Internal Date", 16),
+        ("Engineering Remarks", 42),
+    ]
+
+    header_font = Font(name="Segoe UI", size=10, bold=True, color=WHITE)
+    header_fill = PatternFill(start_color="1E293B", end_color="1E293B", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    ws.row_dimensions[5].height = 28
+    for col_idx, (col_name, col_width) in enumerate(headers, start=1):
+        cell = ws.cell(row=5, column=col_idx, value=col_name)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+        cell.border = thin_border
+        col_letter = get_column_letter(col_idx)
+        ws.column_dimensions[col_letter].width = col_width
+
+    # Risk Styling Map
+    risk_colors = {
+        "HIGH": {"fill": "FEE2E2", "text": "991B1B"},
+        "MEDIUM": {"fill": "FEF3C7", "text": "92400E"},
+        "LOW": {"fill": "DCFCE7", "text": "166534"},
+    }
+
+    # Data Rows
+    for row_idx, item in enumerate(items, start=6):
+        ws.row_dimensions[row_idx].height = 22
+        is_even = (row_idx % 2 == 0)
+        row_bg = ZEBRA_FILL if is_even else WHITE
+        row_fill = PatternFill(start_color=row_bg, end_color=row_bg, fill_type="solid")
+
+        tag_val = item.get("tag") or item.get("asset_number") or ""
+        unit_val = item.get("unit_name") or item.get("field") or ""
+        loc_val = item.get("location") or item.get("plant") or ""
+        risk_val = item.get("risk_category") or "LOW"
+        cui_val = "YES" if item.get("is_cui") else "NO"
+        remarks_val = item.get("remarks") or ""
+
+        row_data = [
+            row_idx - 5,
+            item.get("plan_date") or "",
+            item.get("plan_insp_type") or "",
+            tag_val,
+            item.get("name") or "",
+            item.get("source_sheet") or "",
+            unit_val,
+            loc_val,
+            item.get("operating_pressure") or "",
+            risk_val,
+            cui_val,
+            item.get("date_osi_last") or "",
+            item.get("date_internal_last") or "",
+            remarks_val,
+        ]
+
+        for col_idx, val in enumerate(row_data, start=1):
+            cell = ws.cell(row=row_idx, column=col_idx, value=val)
+            cell.font = Font(name="Segoe UI", size=9.5, color="0F172A")
+            cell.fill = row_fill
+            cell.border = thin_border
+
+            # Alignment rules
+            if col_idx in (1, 2, 10, 11, 12, 13):
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            elif col_idx in (3, 4, 9):
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            else:
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+
+            # Risk pill styling
+            if col_idx == 10 and risk_val in risk_colors:
+                rc = risk_colors[risk_val]
+                cell.fill = PatternFill(start_color=rc["fill"], end_color=rc["fill"], fill_type="solid")
+                cell.font = Font(name="Segoe UI", size=9.5, bold=True, color=rc["text"])
+
+            # CUI highlight
+            if col_idx == 11 and cui_val == "YES":
+                cell.fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+                cell.font = Font(name="Segoe UI", size=9.5, bold=True, color="991B1B")
+
+            # Scope tinting
+            if col_idx == 3:
+                scope_str = str(val)
+                if "Internal" in scope_str and "OSI" in scope_str:
+                    cell.font = Font(name="Segoe UI", size=9.5, bold=True, color="D97706")
+                elif "Internal" in scope_str:
+                    cell.font = Font(name="Segoe UI", size=9.5, bold=True, color="7C3AED")
+                elif "OSI" in scope_str:
+                    cell.font = Font(name="Segoe UI", size=9.5, bold=True, color="0284C7")
+
+    # Enable AutoFilter on header row
+    last_col_letter = get_column_letter(len(headers))
+    last_row = max(6, 5 + len(items))
+    ws.auto_filter.ref = f"A5:{last_col_letter}{last_row}"
+
+    # Freeze panes below header row
+    ws.freeze_panes = "A6"
+
+    # Save to memory buffer
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    filename = f"Statutory_Inspection_Plan_{year}.xlsx"
+    return buf.getvalue(), filename
+
+
+def api_get_reconciliation():
+    with CONN_LOCK:
+        cur = CONN.cursor()
+        total = cur.execute("SELECT count(*) FROM refined_plan_items").fetchone()[0]
+
+        matched = cur.execute("SELECT count(*) FROM refined_plan_items WHERE match_status='MATCHED'").fetchone()[0]
+        unmatched = total - matched
+        variances = cur.execute("SELECT count(*) FROM refined_plan_items WHERE date_variance_days IS NOT NULL AND abs(date_variance_days) > 60").fetchone()[0]
+        delayed = cur.execute("SELECT count(*) FROM refined_plan_items WHERE date_variance_days > 60").fetchone()[0]
+        proactive = cur.execute("SELECT count(*) FROM refined_plan_items WHERE date_variance_days < -60").fetchone()[0]
+        aligned = cur.execute("SELECT count(*) FROM refined_plan_items WHERE date_variance_days IS NOT NULL AND abs(date_variance_days) <= 60").fetchone()[0]
+        
+        ut_done = cur.execute("SELECT count(*) FROM refined_plan_items WHERE ut_progress = 'Done'").fetchone()[0]
+        ut_holding = cur.execute("SELECT count(*) FROM refined_plan_items WHERE ut_progress = 'holding'").fetchone()[0]
+        rep_issued = cur.execute("SELECT count(*) FROM refined_plan_items WHERE report_issued = 'Done'").fetchone()[0]
+
+        synced_count = cur.execute("SELECT count(*) FROM refined_plan_items WHERE synced_to_master = 1").fetchone()[0]
+        pending_sync = cur.execute("""
+            SELECT count(*) 
+            FROM refined_plan_items 
+            WHERE asset_id IS NOT NULL 
+              AND (LOWER(ut_progress) LIKE '%done%' OR LOWER(report_issued) LIKE '%done%')
+              AND (synced_to_master IS NULL OR synced_to_master = 0)
+        """).fetchone()[0]
+        
+        # Omissions: master assets overdue or high risk not in refined plan
+        t_today = today()
+        cur.execute("""
+            SELECT count(*)
+            FROM assets a
+            WHERE a.archived = 0
+              AND ((a.date_osi_next IS NOT NULL AND a.date_osi_next < ?) 
+                OR (a.date_internal_next IS NOT NULL AND a.date_internal_next < ?) 
+                OR a.risk_category = 'HIGH')
+              AND a.id NOT IN (SELECT asset_id FROM refined_plan_items WHERE asset_id IS NOT NULL)
+        """, (t_today, t_today))
+        omitted_count = cur.fetchone()[0]
+
+    return {
+        "total_items": total,
+        "matched_count": matched,
+        "unmatched_count": unmatched,
+        "match_rate": round(matched / total * 100, 1) if total else 0,
+        "variance_count": variances,
+        "delayed_count": delayed,
+        "proactive_count": proactive,
+        "aligned_count": aligned,
+        "omitted_overdue_count": omitted_count,
+        "synced_count": synced_count,
+        "pending_sync_count": pending_sync,
+        "progress_stats": {
+            "ut_done": ut_done,
+            "ut_holding": ut_holding,
+            "report_issued": rep_issued,
+            "ut_percent": round(ut_done / total * 100, 1) if total else 0,
+            "report_percent": round(rep_issued / total * 100, 1) if total else 0,
+        }
+    }
+
+
+def filter_by_search_tokens(rows, q, search_fields):
+    """
+    Industrial search matcher:
+    - Multi-token (all tokens must match)
+    - Punctuation-insensitive alphanumeric matching (e.g. V-1842-B matches V 1842-B and V1842B)
+    - Checks tags, descriptions, categories, progress, locations, remarks, etc.
+    """
+    if not q or not str(q).strip():
+        return rows
+
+    raw_tokens = [t.strip() for t in str(q).strip().split() if t.strip()]
+    if not raw_tokens:
+        return rows
+
+    token_criteria = []
+    for tok in raw_tokens:
+        low = tok.lower()
+        alnum = re.sub(r'[^a-z0-9]', '', low)
+        token_criteria.append((low, alnum))
+
+    matched = []
+    for r in rows:
+        text_chunks = []
+        for f in search_fields:
+            val = r.get(f)
+            if val is not None:
+                text_chunks.append(str(val))
+
+        full_text = " ".join(text_chunks).lower()
+        full_alnum = re.sub(r'[^a-z0-9]', '', full_text)
+
+        all_match = True
+        for low, alnum in token_criteria:
+            if low in full_text:
+                continue
+            if alnum and len(alnum) >= 2 and alnum in full_alnum:
+                continue
+            all_match = False
+            break
+
+        if all_match:
+            matched.append(r)
+
+    return matched
+
+
+RECON_SEARCH_FIELDS = [
+    "pkg_or_asset_no", "item_description", "extracted_tag",
+    "category", "scope_category", "priority", "insp_scope_remarks",
+    "ut_progress", "report_issued", "api_eval_done", "kpc_updated", "kpc_sent",
+    "remarks", "match_status", "match_method", "planned_insp_date", "last_insp_date",
+    "master_name", "master_tag", "master_source_sheet", "master_risk",
+    "master_location", "master_remarks", "master_osi_next", "master_internal_next",
+    "master_op_press", "master_cui", "asset_id", "id"
+]
+
+
+def api_list_refined_plan(params):
+    view_filter = params.get("filter", ["all"])[0].strip().lower()
+    cat_filter = params.get("category", [""])[0].strip()
+    q = params.get("q", [""])[0].strip()
+
+    query = """
+        SELECT r.*, 
+               a.name AS master_name, a.tag AS master_tag, a.source_sheet AS master_source_sheet,
+               a.risk_category AS master_risk, a.date_osi_next AS master_osi_next,
+               a.date_internal_next AS master_internal_next, a.operating_pressure AS master_op_press,
+               a.cui_susceptible AS master_cui, a.location AS master_location, a.remarks AS master_remarks
+        FROM refined_plan_items r
+        LEFT JOIN assets a ON r.asset_id = a.id
+        WHERE 1=1
+    """
+    args = []
+
+    if view_filter == "matched":
+        query += " AND UPPER(r.match_status) = 'MATCHED'"
+    elif view_filter == "unmatched":
+        query += " AND (r.match_status IS NULL OR UPPER(r.match_status) != 'MATCHED')"
+    elif view_filter == "variances":
+        query += " AND r.date_variance_days IS NOT NULL AND abs(r.date_variance_days) > 60"
+    elif view_filter == "delayed":
+        query += " AND r.date_variance_days > 60"
+    elif view_filter == "proactive":
+        query += " AND r.date_variance_days < -60"
+    elif view_filter == "done":
+        query += " AND (LOWER(r.ut_progress) = 'done' OR LOWER(r.report_issued) = 'done')"
+    elif view_filter == "holding":
+        query += " AND (LOWER(r.ut_progress) = 'holding' OR LOWER(r.report_issued) = 'holding')"
+
+    if cat_filter:
+        query += " AND r.category = ?"
+        args.append(cat_filter)
+
+    query += " ORDER BY CASE WHEN r.date_variance_days IS NOT NULL THEN abs(r.date_variance_days) ELSE 0 END DESC, r.id ASC"
+
+    with CONN_LOCK:
+        rows = [dict(r) for r in CONN.execute(query, args).fetchall()]
+
+    if q:
+        rows = filter_by_search_tokens(rows, q, RECON_SEARCH_FIELDS)
+
+    return rows
+
+
+def api_get_reconciliation_omissions(params=None):
+    q = ""
+    if params:
+        q = params.get("q", [""])[0].strip()
+    t_today = today()
+    query = """
+        SELECT a.id, a.name, a.tag, a.source_sheet, a.field, a.plant, a.location,
+               a.risk_category, a.date_osi_next, a.date_internal_next,
+               a.operating_pressure, a.remarks
+        FROM assets a
+        WHERE a.archived = 0
+          AND ((a.date_osi_next IS NOT NULL AND a.date_osi_next < ?) 
+            OR (a.date_internal_next IS NOT NULL AND a.date_internal_next < ?) 
+            OR a.risk_category = 'HIGH')
+          AND a.id NOT IN (SELECT asset_id FROM refined_plan_items WHERE asset_id IS NOT NULL)
+        ORDER BY CASE WHEN a.risk_category = 'HIGH' THEN 1 ELSE 2 END,
+                 COALESCE(a.date_internal_next, a.date_osi_next) ASC
+    """
+    with CONN_LOCK:
+        rows = [row_to_dict(r) for r in CONN.execute(query, (t_today, t_today)).fetchall()]
+
+    if q:
+        fields = [
+            "id", "name", "tag", "source_sheet", "field", "plant", "location",
+            "risk_category", "remarks", "operating_pressure",
+            "date_osi_next", "date_internal_next"
+        ]
+        rows = filter_by_search_tokens(rows, q, fields)
+
+    return rows
+
+
+def api_link_refined_item(item_id, payload):
+    asset_id = payload.get("asset_id")
+    with CONN_LOCK:
+        cur = CONN.cursor()
+        if asset_id:
+            asset = cur.execute("SELECT id, date_osi_next, date_internal_next FROM assets WHERE id = ?", (asset_id,)).fetchone()
+            if not asset:
+                return {"error": f"Asset #{asset_id} not found"}
+            item = cur.execute("SELECT planned_insp_date, scope_category FROM refined_plan_items WHERE id = ?", (item_id,)).fetchone()
+            
+            p_date = item["planned_insp_date"] if item else None
+            variance = None
+            if p_date:
+                scope = (item["scope_category"] or "").lower()
+                ref_d = asset["date_internal_next"] if "internal" in scope else (asset["date_osi_next"] or asset["date_internal_next"])
+                if ref_d:
+                    try:
+                        variance = (datetime.date.fromisoformat(p_date) - datetime.date.fromisoformat(ref_d)).days
+                    except Exception:
+                        pass
+
+            cur.execute("""
+                UPDATE refined_plan_items 
+                SET asset_id = ?, match_status = 'MATCHED', match_method = 'MANUAL', date_variance_days = ?
+                WHERE id = ?
+            """, (asset_id, variance, item_id))
+        else:
+            cur.execute("""
+                UPDATE refined_plan_items 
+                SET asset_id = NULL, match_status = 'UNMATCHED', match_method = NULL, date_variance_days = NULL
+                WHERE id = ?
+            """, (item_id,))
+        CONN.commit()
+        row = cur.execute("SELECT * FROM refined_plan_items WHERE id = ?", (item_id,)).fetchone()
+    return dict(row) if row else {"error": "not found"}
+
+
+def api_export_reconciled_csv(params):
+    items = api_list_refined_plan(params)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "Refined Plan ID", "Match Status", "Master Asset ID", "Category",
+        "Refined Pkg / Asset#", "Item Description", "Extracted Tag",
+        "Master Asset Name", "Master Tag", "Master Sheet", "Master Risk",
+        "Planned Insp Date", "Master Next OSI", "Master Next Internal",
+        "Variance (Days)", "Scope Category", "Priority", "UT Progress",
+        "Report Issued?", "Remarks"
+    ])
+    for it in items:
+        writer.writerow([
+            it.get("id"), it.get("match_status"), it.get("asset_id") or "",
+            it.get("category") or "", it.get("pkg_or_asset_no") or "",
+            it.get("item_description") or "", it.get("extracted_tag") or "",
+            it.get("master_name") or "", it.get("master_tag") or "",
+            it.get("master_source_sheet") or "", it.get("master_risk") or "",
+            it.get("planned_insp_date") or "", it.get("master_osi_next") or "",
+            it.get("master_internal_next") or "", it.get("date_variance_days") if it.get("date_variance_days") is not None else "",
+            it.get("scope_category") or "", it.get("priority") or "",
+            it.get("ut_progress") or "", it.get("report_issued") or "",
+            it.get("remarks") or ""
+        ])
+    return output.getvalue()
 
 
 def api_get_asset(asset_id):
@@ -726,8 +1458,10 @@ def api_add_log(asset_id, payload):
             params.append(insp_date)
             
         if next_due:
+            status_field = "status_osi_next" if is_osi else "status_internal_next"
             next_field = "date_osi_next" if is_osi else "date_internal_next"
             updates.append(f"{next_field} = ?")
+            updates.append(f"{status_field} = 'Scheduled'")
             params.append(next_due)
 
         if updates:
@@ -812,7 +1546,7 @@ def _do_reimport(xlsx_path, display_name, clean_wipe=False):
 
 def api_reimport(payload=None):
     payload = payload or {}
-    xlsx_file = payload.get("xlsx_path") or "1. Master Inspection Plan - Updated 4-6-2026.xlsx"
+    xlsx_file = payload.get("xlsx_path") or "1. Master Inspection Plan.xlsx"
     clean_wipe = bool(payload.get("clean_wipe", False))
     if not os.path.exists(xlsx_file):
         cwd_files = [f for f in os.listdir(".") if f.endswith(".xlsx") and not f.startswith("~$")]
@@ -839,6 +1573,36 @@ def api_reimport_file(payload):
         f.write(binary_data)
 
     return _do_reimport(temp_path, filename, clean_wipe=clean_wipe)
+
+
+def api_import_refined_file(payload):
+    import base64
+    filename = payload.get("filename") or "refined plan.xlsx"
+    filedata = payload.get("filedata")
+    if not filedata:
+        raise ValueError("No file content uploaded.")
+
+    save_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    temp_path = os.path.join(save_dir, "temp_refined_plan.xlsx")
+
+    binary_data = base64.b64decode(filedata)
+    with open(temp_path, "wb") as f:
+        f.write(binary_data)
+
+    from import_refined_plan import import_refined_plan
+    count, matched = import_refined_plan(temp_path, DB_PATH)
+    try:
+        os.remove(temp_path)
+    except Exception:
+        pass
+
+    rate = (matched / count * 100) if count else 0
+    return {
+        "ok": True,
+        "message": f"Successfully imported {count} items ({matched} matched with Master Plan, {rate:.1f}% match rate).",
+        "total": count,
+        "matched": matched,
+    }
 
 
 def api_delete_log(log_id):
@@ -950,6 +1714,29 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(api_list_critical_assets())
             elif path == "/api/yearly_plan":
                 self._send_json(api_yearly_plan(params))
+            elif path == "/api/yearly_plan/export.xlsx":
+                xlsx_bytes, filename = api_export_yearly_excel(params)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(len(xlsx_bytes)))
+                self.end_headers()
+                self.wfile.write(xlsx_bytes)
+            elif path == "/api/reconciliation":
+                self._send_json(api_get_reconciliation())
+            elif path == "/api/refined_plan":
+                self._send_json(api_list_refined_plan(params))
+            elif path == "/api/reconciliation/omissions":
+                self._send_json(api_get_reconciliation_omissions(params))
+            elif path == "/api/reconciliation/export.csv":
+                csv_text = api_export_reconciled_csv(params)
+                body = csv_text.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv")
+                self.send_header("Content-Disposition", 'attachment; filename="campaign_reconciliation_export.csv"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif path.startswith("/api/assets/"):
                 asset_id = int(path.rsplit("/", 1)[-1])
                 d = api_get_asset(asset_id)
@@ -1000,6 +1787,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(api_reimport(payload))
             elif path == "/api/reimport_file":
                 self._send_json(api_reimport_file(payload))
+            elif path == "/api/reconciliation/import":
+                self._send_json(api_import_refined_file(payload))
+            elif path == "/api/reconciliation/clear":
+                self._send_json(api_clear_reconciliation())
+            elif path == "/api/reconciliation/sync_completed":
+                self._send_json(api_sync_completed_to_master())
+            elif path.startswith("/api/refined_plan/") and path.endswith("/link"):
+                item_id = int(path.split("/")[3])
+                self._send_json(api_link_refined_item(item_id, payload))
             elif path.endswith("/log") and path.startswith("/api/assets/"):
                 asset_id = int(path.split("/")[3])
                 self._send_json(api_add_log(asset_id, payload))

@@ -40,6 +40,9 @@
       <button class="tab" data-view="yearly">
         <span class="tab-icon">📅</span> Yearly Plan
       </button>
+      <button class="tab" data-view="reconciliation">
+        <span class="tab-icon">🎯</span> Campaign Reconciliation
+      </button>
     </nav>
 
     <div class="topbar-actions">
@@ -53,8 +56,8 @@
       <button id="btnNewAsset" class="btn primary" title="Add a new asset manually">
         <span>+</span> New Asset
       </button>
-      <button id="btnClearDatabase" class="btn danger small" title="Clear all records from database with backup">
-        <span>🗑️</span> Clear All
+      <button id="btnClearDatabase" class="btn danger small" title="Clear all records from Master Plan database with backup to import another">
+        <span>🗑️</span> Clear Master Plan
       </button>
     </div>
   </header>
@@ -217,6 +220,19 @@
           <option value="location">Group by Location</option>
         </select>
 
+        <select id="overdueTypeFilter">
+          <option value="">All Overdue Types</option>
+          <option value="internal">Internal Overdue (Shutdown Required)</option>
+          <option value="osi">OSI Overdue (On-Stream)</option>
+          <option value="both">Both Overdue</option>
+        </select>
+
+        <select id="specialStatusFilter">
+          <option value="">All Special Statuses</option>
+          <option value="next_sd">Next Shutdown (Next SD)</option>
+          <option value="w_eval">Waiting Evaluation (W/Eval)</option>
+        </select>
+
         <label class="checkbox">
           <input type="checkbox" id="overdueOnly"> Overdue Only
         </label>
@@ -297,11 +313,111 @@
       <div class="toolbar">
         <label for="yearInput" style="font-weight:600;">Plan Year:</label>
         <input id="yearInput" type="number" min="2020" max="2040" style="width:110px;">
+
+        <select id="yearlySheetFilter">
+          <option value="">All Sheets (Global)</option>
+        </select>
+
+        <select id="yearlyTypeFilter">
+          <option value="all">All Inspection Scopes</option>
+          <option value="internal">Internal (Shutdown) Only</option>
+          <option value="osi">OSI (On-Stream) Only</option>
+        </select>
+
         <button id="btnLoadYear" class="btn primary">Generate Plan</button>
         <button id="btnPrintYear" class="btn ghost">🖨️ Print Outage Report</button>
+        <button id="btnExportYearlyExcel" class="btn success">📊 Export to Excel</button>
         <span id="yearlyMeta" class="count-text" style="margin-left:auto;"></span>
       </div>
       <div id="yearlyTableWrap" class="asset-table-wrap full"></div>
+    </section>
+
+    <!-- CAMPAIGN RECONCILIATION VIEW -->
+    <section id="view-reconciliation" class="view">
+      <!-- Executive Reconciliation Header -->
+      <div class="compliance-banner" style="margin-bottom: 20px;">
+        <div class="compliance-title">
+          <div class="shield-icon">🎯</div>
+          <div>
+            <h3>Refined Campaign Plan Reconciliation</h3>
+            <p>Cross-referencing tactical execution plan (<code>refined plan.xlsx</code>) against statutory Master Plan baseline (<code>inspection_plan.db</code>)</p>
+          </div>
+        </div>
+        <div class="compliance-kpi-group">
+          <div class="kpi-mini">
+            <div class="val" id="kpiReconMatchRate" style="color:var(--accent);">--%</div>
+            <div class="lbl">Master Plan Match Rate</div>
+          </div>
+          <div class="kpi-mini">
+            <div class="val" id="kpiReconUtRate" style="color:#00e676;">--%</div>
+            <div class="lbl">Field UT Execution</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Reconciliation KPI Row -->
+      <div class="stat-row" id="reconStatRow" style="margin-bottom: 20px;">
+        <div class="stat-card" onclick="setReconFilter('all')" style="cursor:pointer;" title="View all campaign items">
+          <div class="n" id="reconTotalItems">198</div>
+          <div class="label">Campaign Scope</div>
+        </div>
+        <div class="stat-card ok" onclick="setReconFilter('matched')" style="cursor:pointer;" title="Items matched to Master Plan">
+          <div class="n" id="reconMatchedItems" style="color:#00e676;">--</div>
+          <div class="label">Matched with Master</div>
+        </div>
+        <div class="stat-card warning" onclick="setReconFilter('variances')" style="cursor:pointer;" title="Planned date differs from Master statutory due date">
+          <div class="n" id="reconVariances" style="color:#ffab00;">--</div>
+          <div class="label">Date Variances</div>
+        </div>
+        <div class="stat-card overdue" onclick="setReconFilter('omissions')" style="cursor:pointer;" title="Master overdue assets missing from campaign">
+          <div class="n" id="reconOmissions" style="color:#ff5252;">--</div>
+          <div class="label">Omitted Master Overdue</div>
+        </div>
+        <div class="stat-card" onclick="setReconFilter('unmatched')" style="cursor:pointer;" title="Uncatalogued or site visit items">
+          <div class="n" id="reconUnmatched" style="color:#b0bec5;">--</div>
+          <div class="label">Unmatched / Review</div>
+        </div>
+      </div>
+
+      <!-- Sub-Tab Filter Pills -->
+      <div class="subnav-bar" style="display:flex; gap:8px; margin-bottom:14px; flex-wrap:wrap;">
+        <button class="subnav-btn active" data-recon-filter="all" onclick="setReconFilter('all')">
+          📋 All Campaign Items (<span id="countSubAll">198</span>)
+        </button>
+        <button class="subnav-btn" data-recon-filter="variances" onclick="setReconFilter('variances')">
+          ⚠️ Date Variances (<span id="countSubVariances">--</span>)
+        </button>
+        <button class="subnav-btn" data-recon-filter="omissions" onclick="setReconFilter('omissions')">
+          🚨 Omitted Master Overdue (<span id="countSubOmissions">--</span>)
+        </button>
+        <button class="subnav-btn" data-recon-filter="done" onclick="setReconFilter('done')">
+          ✅ UT / Reports Completed (<span id="countSubDone">--</span>)
+        </button>
+        <button class="subnav-btn" data-recon-filter="holding" onclick="setReconFilter('holding')">
+          ⏳ Holding / Pending (<span id="countSubHolding">--</span>)
+        </button>
+        <button class="subnav-btn" data-recon-filter="unmatched" onclick="setReconFilter('unmatched')">
+          ❓ Unmatched Items (<span id="countSubUnmatched">--</span>)
+        </button>
+      </div>
+
+      <!-- Toolbar -->
+      <div class="toolbar" id="reconToolbar">
+        <input type="search" id="reconSearchBox" placeholder="Search item, tag, package, scope..." style="width:280px;">
+        <select id="reconCategoryFilter">
+          <option value="">All Categories</option>
+        </select>
+        <button id="btnBulkSyncMaster" class="btn success small" title="Bulk log official inspections in Master Plan for completed campaign items and advance statutory due dates">⚡ Sync Completed to Master (<span id="btnDoneCount">138</span>)</button>
+        <button id="btnImportRefined" class="btn primary small" title="Upload and import Refined Plan Excel spreadsheet (.xlsx)">📤 Import Refined Plan</button>
+        <input type="file" id="refinedFileInput" accept=".xlsx,.xls" style="display:none;">
+        <button id="btnClearRecon" class="btn danger small" title="Clear reconciled campaign data and restore original view">🗑️ Clear Campaign Plan</button>
+        <button id="btnExportRecon" class="btn ghost">📥 Export Schedule (CSV)</button>
+        <button id="btnReloadRecon" class="btn ghost small" title="Refresh">🔄</button>
+        <span id="reconMetaText" class="count-text" style="margin-left:auto;"></span>
+      </div>
+
+      <!-- Reconciliation Main Table Wrap -->
+      <div id="reconciliationTableWrap" class="asset-table-wrap full"></div>
     </section>
 
   </main>

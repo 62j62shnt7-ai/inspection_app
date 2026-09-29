@@ -233,6 +233,18 @@ html, body {
   border-color: var(--red);
 }
 
+.btn.success {
+  color: #00e676;
+  border-color: rgba(0, 230, 118, 0.4);
+  background: rgba(0, 230, 118, 0.12);
+  font-weight: 600;
+}
+
+.btn.success:hover:not(:disabled) {
+  background: rgba(0, 230, 118, 0.25);
+  border-color: #00e676;
+}
+
 .btn-clear {
   position: absolute;
   right: 10px;
@@ -951,6 +963,142 @@ table.assets tbody tr:hover td {
 .status-pill.none {
   background: rgba(255,255,255,0.05);
   color: var(--text-faint);
+}
+
+.status-pill.warning {
+  background: rgba(255, 171, 0, 0.16);
+  color: #ffab00;
+  border: 1px solid rgba(255, 171, 0, 0.4);
+}
+
+.status-pill.info {
+  background: rgba(33, 150, 243, 0.16);
+  color: #29b6f6;
+  border: 1px solid rgba(33, 150, 243, 0.4);
+}
+
+.badge-scope {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  margin-right: 4px;
+}
+
+.badge-scope.osi {
+  background: rgba(0, 210, 255, 0.15);
+  color: #00d2ff;
+  border: 1px solid rgba(0, 210, 255, 0.35);
+}
+
+.badge-scope.internal {
+  background: rgba(187, 134, 252, 0.15);
+  color: #bb86fc;
+  border: 1px solid rgba(187, 134, 252, 0.35);
+}
+
+.badge-scope.both {
+  background: rgba(255, 152, 0, 0.15);
+  color: #ffa726;
+  border: 1px solid rgba(255, 152, 0, 0.35);
+}
+
+/* Reconciliation Subnav Buttons */
+.subnav-bar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.subnav-btn {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-family: var(--font-sans);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 6px 14px;
+  border-radius: 20px;
+  cursor: pointer;
+  transition: all 0.18s ease;
+}
+
+.subnav-btn:hover {
+  background: var(--bg-hover);
+  color: #fff;
+  border-color: var(--border-light);
+}
+
+.subnav-btn.active {
+  background: rgba(0, 210, 255, 0.12);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Variance Pills */
+.variance-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 700;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+.variance-pill.ok {
+  background: rgba(0, 230, 118, 0.15);
+  color: #00e676;
+  border: 1px solid rgba(0, 230, 118, 0.35);
+}
+
+.variance-pill.late {
+  background: rgba(255, 82, 82, 0.15);
+  color: #ff5252;
+  border: 1px solid rgba(255, 82, 82, 0.35);
+}
+
+.variance-pill.ahead {
+  background: rgba(187, 134, 252, 0.15);
+  color: #bb86fc;
+  border: 1px solid rgba(187, 134, 252, 0.35);
+}
+
+/* Progress Pills */
+.badge-progress {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.badge-progress.done {
+  background: rgba(0, 230, 118, 0.15);
+  color: #00e676;
+  border: 1px solid rgba(0, 230, 118, 0.35);
+}
+
+.badge-progress.holding {
+  background: rgba(255, 171, 0, 0.15);
+  color: #ffab00;
+  border: 1px solid rgba(255, 171, 0, 0.35);
+}
+
+.badge-progress.oos {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-faint);
+  border: 1px solid rgba(255, 255, 255, 0.12);
 }
 
 .badge-risk {

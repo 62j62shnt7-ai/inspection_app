@@ -33,13 +33,14 @@ MONTH_MAP = {
 DATE_PATTERNS = [
     re.compile(r"^\s*(\d{4})\s*$"),                                      # 2024
     re.compile(r"^\s*(\d{1,2})[-/](\d{4})\s*$"),                          # 09/2024, 9-2024
-    re.compile(r"^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})\s*$"),            # 2024-09-15
-    re.compile(r"^\s*(\d{1,2})[-/](\d{1,2})[-/](\d{4})\s*$"),            # 15/09/2024 or 09/15/2024
+    re.compile(r"^\s*(\d{4})[-/](\d{1,2})[-/](\d{1,2})(?:\s+.*)?$"),    # 2024-09-15 or 2024-09-15 00:00:00
+    re.compile(r"^\s*(\d{1,2})[-/](\d{1,2})[-/](\d{4})(?:\s+.*)?$"),    # 15/09/2024 or 09/15/2024
     re.compile(r"^\s*([A-Za-z]+)\s*[-/ ]\s*(\d{4})\s*$"),                # Sep-2024, June 2024
     re.compile(r"^\s*([A-Za-z]+)\s*[-/ ]\s*(\d{2})\s*$"),                # June -19, Jun-22
-    re.compile(r"^\s*(\d{1,2})\s*[-/ ]\s*([A-Za-z]+)\s*[-/ ]\s*(\d{4})\s*$"),  # 15-Sep-2024
-    re.compile(r"^\s*(\d{1,2})\s*[-/ ]\s*([A-Za-z]+)\s*[-/ ]\s*(\d{2})\s*$"),    # 15-Sep-24
+    re.compile(r"^\s*(\d{1,2})\s*[-/ ]\s*([A-Za-z]+)\s*[-/ ]\s*(\d{4})(?:\s+.*)?$"),  # 15-Sep-2024
+    re.compile(r"^\s*(\d{1,2})\s*[-/ ]\s*([A-Za-z]+)\s*[-/ ]\s*(\d{2})(?:\s+.*)?$"),    # 15-Sep-24
     re.compile(r"^\s*Q([1-4])[-/ ](\d{4})\s*$", re.I),                   # Q3 2024
+    re.compile(r"^\s*(\d{4})\s*-\s*(\d{4})\s*$"),                         # 2005 - 2011 (take latest)
 ]
 
 import_errors = []
@@ -53,65 +54,117 @@ def import_sheet_guard(sheet_name):
         print(f"  [!] ERROR importing {sheet_name}: {e}")
 
 
+def fix_century(iso_str):
+    """Corrects 2-digit year interpretation where 2030-2069 becomes 1930-1969."""
+    if not iso_str:
+        return None
+    try:
+        parts = iso_str.split("-")
+        yr = int(parts[0])
+        if 1930 <= yr <= 1969:
+            return f"{yr + 100}-{parts[1]}-{parts[2]}"
+    except Exception:
+        pass
+    return iso_str
+
+
 def parse_date(value):
-    """Smart multi-format date parser into ISO date string (YYYY-MM-DD)."""
+    """Smart multi-format date parser into (ISO date string YYYY-MM-DD, raw_text)."""
     if value is None:
         return None, None
     if isinstance(value, (datetime.datetime, datetime.date)):
         try:
-            return value.strftime("%Y-%m-%d"), None
+            yr = value.year
+            if 1930 <= yr <= 1969:
+                value = value.replace(year=yr + 100)
+            iso_str = value.strftime("%Y-%m-%d")
+            return iso_str, iso_str
         except Exception:
             return None, str(value)
     text = str(value).strip()
     if not text:
         return None, None
 
+    # Check for multi-year string like '2002 - 2003 - 2013-2017'
+    years = re.findall(r"\b(19\d\d|20\d\d)\b", text)
+
     for idx, pat in enumerate(DATE_PATTERNS):
         m = pat.match(text)
         if not m:
             continue
         if idx == 0: # 2024
-            return f"{m.group(1)}-01-01", text
+            return fix_century(f"{m.group(1)}-01-01"), text
         elif idx == 1: # 09/2024
             month, year = int(m.group(1)), m.group(2)
             if 1 <= month <= 12:
-                return f"{year}-{month:02d}-01", text
+                return fix_century(f"{year}-{month:02d}-01"), text
         elif idx == 2: # 2024-09-15
-            return f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}", text
+            return fix_century(f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"), text
         elif idx == 3: # 15/09/2024 or 09/15/2024
             p1, p2, year = int(m.group(1)), int(m.group(2)), m.group(3)
             month = p1 if 1 <= p1 <= 12 else (p2 if 1 <= p2 <= 12 else 1)
             day = p2 if p1 == month else p1
-            return f"{year}-{month:02d}-{min(day, 28):02d}", text
+            return fix_century(f"{year}-{month:02d}-{min(day, 28):02d}"), text
         elif idx == 4: # Sep-2024, June 2024
             mon_str = m.group(1).lower()
             mon_num = MONTH_MAP.get(mon_str) or MONTH_MAP.get(mon_str[:3])
             if mon_num:
-                return f"{m.group(2)}-{mon_num:02d}-01", text
+                return fix_century(f"{m.group(2)}-{mon_num:02d}-01"), text
         elif idx == 5: # June -19, Jun-22
             mon_str = m.group(1).lower()
             mon_num = MONTH_MAP.get(mon_str) or MONTH_MAP.get(mon_str[:3])
             yr_2digit = int(m.group(2))
             full_year = 2000 + yr_2digit if yr_2digit < 70 else 1900 + yr_2digit
             if mon_num:
-                return f"{full_year}-{mon_num:02d}-01", text
+                return fix_century(f"{full_year}-{mon_num:02d}-01"), text
         elif idx == 6: # 15-Sep-2024
             day, mon_str, year = int(m.group(1)), m.group(2).lower(), m.group(3)
             mon_num = MONTH_MAP.get(mon_str) or MONTH_MAP.get(mon_str[:3])
             if mon_num:
-                return f"{year}-{mon_num:02d}-{min(day, 28):02d}", text
+                return fix_century(f"{year}-{mon_num:02d}-{min(day, 28):02d}"), text
         elif idx == 7: # 15-Sep-24
             day, mon_str, yr_2digit = int(m.group(1)), m.group(2).lower(), int(m.group(3))
             mon_num = MONTH_MAP.get(mon_str) or MONTH_MAP.get(mon_str[:3])
             full_year = 2000 + yr_2digit if yr_2digit < 70 else 1900 + yr_2digit
             if mon_num:
-                return f"{full_year}-{mon_num:02d}-{min(day, 28):02d}", text
+                return fix_century(f"{full_year}-{mon_num:02d}-{min(day, 28):02d}"), text
         elif idx == 8: # Q3 2024
             qtr, year = int(m.group(1)), m.group(2)
             qtr_month = (qtr - 1) * 3 + 1
-            return f"{year}-{qtr_month:02d}-01", text
+            return fix_century(f"{year}-{qtr_month:02d}-01"), text
+        elif idx == 9: # 2005 - 2011 -> take latest
+            return fix_century(f"{m.group(2)}-01-01"), text
+
+    if len(years) > 1 and "-" in text:
+        return fix_century(f"{years[-1]}-01-01"), text
 
     return None, text
+
+
+def categorize_status(raw_text, iso_date=None):
+    """Categorizes non-date operational status into standard labels."""
+    if not raw_text:
+        return "No Date" if not iso_date else "Scheduled"
+    t = str(raw_text).strip().lower()
+    if "overdue" in t:
+        return "Overdue"
+    if any(k in t for k in ["next sd", "nsd", "s/d", "shutdown"]):
+        return "Next SD"
+    if any(k in t for k in ["w/eval", "waiting eval", "waiting evaluation", "w/evaluation", "eval"]):
+        return "W/Eval"
+    if any(k in t for k in ["oos", "shut-in", "out of service"]):
+        return "OOS"
+    if "insulated" in t or "refractory" in t:
+        return "Insulated"
+    if "repair" in t:
+        return "After Repair"
+    if "check" in t:
+        return "Check"
+    if t in ("na", "n/a", "none") or "never" in t or "out of scope" in t:
+        return "N/A"
+    if iso_date:
+        return "Scheduled"
+    return str(raw_text).strip()
 
 
 def clean_str(val):
@@ -236,16 +289,24 @@ def parse_vessels_and_tks(conn, ws, clean_wipe):
         if not sn and not name and not tag:
             continue
         
-        d_osi_last, _ = parse_date(ws.cell(r, 14).value)
-        d_osi_next, _ = parse_date(ws.cell(r, 15).value)
-        d_int_last, _ = parse_date(ws.cell(r, 16).value)
-        d_int_next, _ = parse_date(ws.cell(r, 17).value)
+        d_osi_last, raw_osi_last = parse_date(ws.cell(r, 14).value)
+        d_osi_next, raw_osi_next = parse_date(ws.cell(r, 15).value)
+        d_int_last, raw_int_last = parse_date(ws.cell(r, 16).value)
+        d_int_next, raw_int_next = parse_date(ws.cell(r, 17).value)
 
-        extra = gather_extra(ws, r, hdr_r, 24)
-        if ws.cell(r, 21).value:
-            extra["RBI Due Date (Internal)"] = str(ws.cell(r, 21).value)
-        if ws.cell(r, 22).value:
-            extra["RBI Due Date (OSI)"] = str(ws.cell(r, 22).value)
+        status_osi_n = categorize_status(raw_osi_next, d_osi_next)
+        status_int_n = categorize_status(raw_int_next, d_int_next)
+
+        if status_osi_n == "Overdue" and not d_osi_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_osi_next))
+            d_osi_next = f"{m_yr.group(1)}-01-01" if m_yr else "2017-09-01"
+
+        if status_int_n == "Overdue" and not d_int_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_int_next))
+            d_int_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
+
+        remarks = clean_str(ws.cell(r, 18).value)
+        extra = gather_extra(ws, r, hdr_r, 19)
 
         record = {
             "source_sheet": "Vessels & TKs",
@@ -259,10 +320,10 @@ def parse_vessels_and_tks(conn, ws, clean_wipe):
             "last_insp_category": clean_str(ws.cell(r, 13).value),
             "date_osi_last": d_osi_last, "date_osi_next": d_osi_next,
             "date_internal_last": d_int_last, "date_internal_next": d_int_next,
-            "next_insp_category": clean_str(ws.cell(r, 18).value),
-            "corrosion_rate": clean_str(ws.cell(r, 19).value),
-            "remaining_life": clean_str(ws.cell(r, 20).value),
-            "remarks": clean_str(ws.cell(r, 23).value),
+            "date_osi_last_raw": raw_osi_last, "date_osi_next_raw": raw_osi_next,
+            "date_internal_last_raw": raw_int_last, "date_internal_next_raw": raw_int_next,
+            "status_osi_next": status_osi_n, "status_internal_next": status_int_n,
+            "remarks": remarks,
         }
         save_record(cur, record, extra, clean_wipe)
         count += 1
@@ -301,14 +362,22 @@ def parse_op_piping(conn, ws, clean_wipe):
     cur = conn.cursor()
     count = 0
     hdr_r = 5
+    current_pack = "PACK 01"
     for r in range(6, ws.max_row + 1):
-        sn = clean_str(ws.cell(r, 2).value)
-        name = clean_str(ws.cell(r, 3).value)
-        if not sn and not name:
+        c2 = clean_str(ws.cell(r, 2).value)
+        c3 = clean_str(ws.cell(r, 3).value)
+        if c2 and ("PACK" in c2.upper() or "MANIFOLD" in c2.upper() or "OIL PROCESS" in c2.upper()):
+            current_pack = c2
+            continue
+        if not c3:
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 7).value)
-        d_next, _ = parse_date(ws.cell(r, 8).value)
+        d_last, raw_last = parse_date(ws.cell(r, 7).value)
+        d_next, raw_next = parse_date(ws.cell(r, 8).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
         extra = gather_extra(ws, r, hdr_r, 9)
         rem_parts = [clean_str(ws.cell(r, 10).value), clean_str(ws.cell(r, 11).value), clean_str(ws.cell(r, 12).value)]
@@ -316,10 +385,12 @@ def parse_op_piping(conn, ws, clean_wipe):
 
         record = {
             "source_sheet": "OP Piping",
-            "sn": sn, "name": name, "plant": "Oil Processing (OP)",
+            "sn": c2, "name": c3, "field": current_pack, "plant": "Oil Processing (OP)",
             "operating_pressure": clean_str(ws.cell(r, 4).value),
             "design_pressure": clean_str(ws.cell(r, 6).value),
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "remarks": rem_str,
         }
         save_record(cur, record, extra, clean_wipe)
@@ -336,25 +407,33 @@ def parse_gp_piping(conn, ws, clean_wipe):
     for r in range(9, ws.max_row + 1):
         c2 = clean_str(ws.cell(r, 2).value)
         c3 = clean_str(ws.cell(r, 3).value)
-        if c2 and "PACK" in c2.upper():
+        if c2 and ("PACK" in c2.upper() or "HEADER" in c2.upper() or "GAS PLANT" in c2.upper()):
             current_pack = c2
             continue
         if not c2 and not c3:
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 9).value)
-        d_next, _ = parse_date(ws.cell(r, 10).value)
+        d_last, raw_last = parse_date(ws.cell(r, 9).value)
+        d_next, raw_next = parse_date(ws.cell(r, 10).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
-        pack_val = clean_str(ws.cell(r, 4).value) or current_pack
+        pack_code = clean_str(ws.cell(r, 4).value)
+        field_val = f"{pack_code} ({current_pack})" if pack_code and current_pack and pack_code not in current_pack else (current_pack or pack_code)
         extra = gather_extra(ws, r, hdr_r, 13)
 
         record = {
             "source_sheet": "GP Piping",
-            "sn": c2, "name": c3 or f"{pack_val} Line", "field": pack_val,
+            "sn": c2, "name": c3 or f"{pack_code or current_pack} Line", "field": field_val,
+            "unit_name": current_pack,
             "plant": "Gas Plant (GP)", "operating_pressure": clean_str(ws.cell(r, 5).value),
             "design_pressure": clean_str(ws.cell(r, 7).value),
             "insulation": clean_str(ws.cell(r, 8).value),
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "corrosion_rate": clean_str(ws.cell(r, 11).value),
             "remarks": clean_str(ws.cell(r, 12).value),
         }
@@ -367,22 +446,35 @@ def parse_turbines_piping(conn, ws, clean_wipe):
     cur = conn.cursor()
     count = 0
     hdr_r = 5
+    current_pack = "Turbines"
     for r in range(6, ws.max_row + 1):
-        sn = clean_str(ws.cell(r, 2).value)
-        name = clean_str(ws.cell(r, 3).value)
-        if not sn and not name:
+        c2 = clean_str(ws.cell(r, 2).value)
+        c3 = clean_str(ws.cell(r, 3).value)
+        if c2 and ("COMP" in c2.upper() or "PACK" in c2.upper() or "UNIT" in c2.upper() or "TURBINES" in c2.upper()):
+            current_pack = c2
+            continue
+        if not c3:
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 8).value)
-        d_next, _ = parse_date(ws.cell(r, 9).value)
+        d_last, raw_last = parse_date(ws.cell(r, 8).value)
+        d_next, raw_next = parse_date(ws.cell(r, 9).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
+        pack_code = clean_str(ws.cell(r, 4).value)
+        field_val = f"{pack_code} ({current_pack})" if pack_code and current_pack and pack_code not in current_pack else (current_pack or pack_code)
         extra = gather_extra(ws, r, hdr_r, 13)
         record = {
             "source_sheet": "Turbines Piping",
-            "sn": sn, "name": name, "field": clean_str(ws.cell(r, 4).value),
+            "sn": c2, "name": c3, "field": field_val,
+            "unit_name": current_pack,
             "plant": "Turbines", "operating_pressure": clean_str(ws.cell(r, 5).value),
             "design_pressure": clean_str(ws.cell(r, 7).value),
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "corrosion_rate": clean_str(ws.cell(r, 10).value),
             "remarks": clean_str(ws.cell(r, 11).value),
             "insulation": clean_str(ws.cell(r, 12).value),
@@ -396,20 +488,30 @@ def parse_op_dead_legs(conn, ws, clean_wipe):
     cur = conn.cursor()
     count = 0
     hdr_r = 3
+    current_system = "OP Dead Leg"
     for r in range(4, ws.max_row + 1):
-        sn = clean_str(ws.cell(r, 2).value)
-        name = clean_str(ws.cell(r, 3).value)
-        if not sn and not name:
+        c2 = clean_str(ws.cell(r, 2).value)
+        c3 = clean_str(ws.cell(r, 3).value)
+        if c2 and not c3:
+            current_system = c2
+            continue
+        if not c3:
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 7).value)
-        d_next, _ = parse_date(ws.cell(r, 8).value)
+        d_last, raw_last = parse_date(ws.cell(r, 7).value)
+        d_next, raw_next = parse_date(ws.cell(r, 8).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
         extra = gather_extra(ws, r, hdr_r, 9)
         record = {
             "source_sheet": "OP Dead Legs",
-            "sn": sn, "name": name, "plant": "Oil Processing (OP)",
-            "location": "Dead Leg", "date_osi_last": d_last, "date_osi_next": d_next,
+            "sn": c2, "name": c3, "plant": "Oil Processing (OP)",
+            "location": current_system, "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "remarks": clean_str(ws.cell(r, 12).value),
         }
         save_record(cur, record, extra, clean_wipe)
@@ -428,8 +530,12 @@ def parse_gp_dead_legs(conn, ws, clean_wipe):
         if not sn and not desc:
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 7).value)
-        d_next, _ = parse_date(ws.cell(r, 8).value)
+        d_last, raw_last = parse_date(ws.cell(r, 7).value)
+        d_next, raw_next = parse_date(ws.cell(r, 8).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
         extra = gather_extra(ws, r, hdr_r, 9)
         name_str = f"{vessel} - {desc}" if vessel and desc else (desc or vessel or f"GP Dead Leg {sn}")
@@ -438,6 +544,8 @@ def parse_gp_dead_legs(conn, ws, clean_wipe):
             "sn": sn, "name": name_str, "plant": "Gas Plant (GP)",
             "location": clean_str(ws.cell(r, 6).value) or "Dead Leg",
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "design_pressure": clean_str(ws.cell(r, 13).value),
             "remarks": clean_str(ws.cell(r, 10).value),
         }
@@ -456,8 +564,12 @@ def parse_wd33_piping(conn, ws, clean_wipe):
         if not sn and not name:
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 9).value)
-        d_next, _ = parse_date(ws.cell(r, 10).value)
+        d_last, raw_last = parse_date(ws.cell(r, 9).value)
+        d_next, raw_next = parse_date(ws.cell(r, 10).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
         extra = gather_extra(ws, r, hdr_r, 11)
         record = {
@@ -468,6 +580,8 @@ def parse_wd33_piping(conn, ws, clean_wipe):
             "operating_pressure": clean_str(ws.cell(r, 7).value),
             "design_pressure": clean_str(ws.cell(r, 8).value),
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "remarks": clean_str(ws.cell(r, 11).value),
         }
         save_record(cur, record, extra, clean_wipe)
@@ -482,11 +596,15 @@ def parse_epfs(conn, ws, clean_wipe):
     for r in range(5, ws.max_row + 1):
         sn = clean_str(ws.cell(r, 2).value)
         name = clean_str(ws.cell(r, 3).value)
-        if not sn and not name:
+        if not name or (sn and "note" in sn.lower()):
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 7).value)
-        d_next, _ = parse_date(ws.cell(r, 8).value)
+        d_last, raw_last = parse_date(ws.cell(r, 7).value)
+        d_next, raw_next = parse_date(ws.cell(r, 8).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
         extra = gather_extra(ws, r, hdr_r, 10)
         record = {
@@ -495,6 +613,8 @@ def parse_epfs(conn, ws, clean_wipe):
             "operating_pressure": clean_str(ws.cell(r, 5).value),
             "design_pressure": clean_str(ws.cell(r, 6).value),
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "remarks": clean_str(ws.cell(r, 9).value),
         }
         save_record(cur, record, extra, clean_wipe)
@@ -511,8 +631,12 @@ def parse_gp_inlet_lines(conn, ws, clean_wipe):
         if not sn or not sn.isdigit():
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 6).value)
-        d_next, _ = parse_date(ws.cell(r, 7).value)
+        d_last, raw_last = parse_date(ws.cell(r, 6).value)
+        d_next, raw_next = parse_date(ws.cell(r, 7).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
         rem_parts = [clean_str(ws.cell(r, 8).value), clean_str(ws.cell(r, 10).value), clean_str(ws.cell(r, 12).value)]
         rem_str = "\n".join([p for p in rem_parts if p])
@@ -523,6 +647,8 @@ def parse_gp_inlet_lines(conn, ws, clean_wipe):
             "nominal_thickness": clean_str(ws.cell(r, 4).value),
             "operating_pressure": clean_str(ws.cell(r, 5).value),
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "remarks": rem_str,
         }
         save_record(cur, record, {}, clean_wipe)
@@ -540,8 +666,12 @@ def parse_mfds(conn, ws, clean_wipe):
         if not sn and not name:
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 8).value)
-        d_next, _ = parse_date(ws.cell(r, 9).value)
+        d_last, raw_last = parse_date(ws.cell(r, 8).value)
+        d_next, raw_next = parse_date(ws.cell(r, 9).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
         extra = gather_extra(ws, r, hdr_r, 10)
         record = {
@@ -550,6 +680,8 @@ def parse_mfds(conn, ws, clean_wipe):
             "fluid_service": clean_str(ws.cell(r, 5).value),
             "operating_pressure": clean_str(ws.cell(r, 7).value) or clean_str(ws.cell(r, 6).value),
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "remarks": clean_str(ws.cell(r, 11).value),
         }
         save_record(cur, record, extra, clean_wipe)
@@ -561,25 +693,36 @@ def parse_tls(conn, ws, clean_wipe):
     cur = conn.cursor()
     count = 0
     hdr_r = 6
-    for r in range(7, ws.max_row + 1):
-        loc = clean_str(ws.cell(r, 2).value)
-        name = clean_str(ws.cell(r, 4).value)
-        if not name and not loc:
+    for r in range(8, ws.max_row + 1):
+        c2 = clean_str(ws.cell(r, 2).value)
+        c3 = clean_str(ws.cell(r, 3).value)
+        c4 = clean_str(ws.cell(r, 4).value)
+        if not c4 and not c2:
+            continue
+        if c2 and c2.lower() == "from" and c3 and c3.lower() == "to":
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 20).value)
-        d_next, _ = parse_date(ws.cell(r, 21).value)
+        d_last, raw_last = parse_date(ws.cell(r, 20).value)
+        d_next, raw_next = parse_date(ws.cell(r, 21).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
         extra = gather_extra(ws, r, hdr_r, 22)
+        loc_str = f"{c2} -> {c3}" if c2 and c3 else (c2 or c3)
+        name_str = c4 or f"Trunkline {loc_str}"
+
         record = {
             "source_sheet": "TLs",
-            "name": name or f"Trunkline {loc}", "location": loc,
-            "in_service": clean_str(ws.cell(r, 5).value),
+            "name": name_str, "location": loc_str, "in_service": clean_str(ws.cell(r, 5).value),
             "operating_pressure": clean_str(ws.cell(r, 6).value),
             "design_pressure": clean_str(ws.cell(r, 7).value),
             "fluid_service": clean_str(ws.cell(r, 8).value),
             "nominal_thickness": f'{clean_str(ws.cell(r, 9).value) or ""} (Sch {clean_str(ws.cell(r, 10).value) or ""})'.strip(),
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "remarks": clean_str(ws.cell(r, 24).value),
         }
         save_record(cur, record, extra, clean_wipe)
@@ -596,8 +739,12 @@ def parse_fls(conn, ws, clean_wipe):
         if not well or "updated" in well.lower():
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 9).value)
-        d_next, _ = parse_date(ws.cell(r, 10).value)
+        d_last, raw_last = parse_date(ws.cell(r, 9).value)
+        d_next, raw_next = parse_date(ws.cell(r, 10).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
         extra = gather_extra(ws, r, hdr_r, 11)
         record = {
@@ -607,6 +754,8 @@ def parse_fls(conn, ws, clean_wipe):
             "operating_pressure": clean_str(ws.cell(r, 5).value),
             "design_pressure": clean_str(ws.cell(r, 6).value),
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "remarks": clean_str(ws.cell(r, 13).value),
         }
         save_record(cur, record, extra, clean_wipe)
@@ -624,8 +773,12 @@ def parse_gl_lines(conn, ws, clean_wipe):
         if not well or not sn:
             continue
 
-        d_last, _ = parse_date(ws.cell(r, 13).value)
-        d_next, _ = parse_date(ws.cell(r, 14).value)
+        d_last, raw_last = parse_date(ws.cell(r, 13).value)
+        d_next, raw_next = parse_date(ws.cell(r, 14).value)
+        status_osi_n = categorize_status(raw_next, d_next)
+        if status_osi_n == "Overdue" and not d_next:
+            m_yr = re.search(r"\b(19\d\d|20\d\d)\b", str(raw_next))
+            d_next = f"{m_yr.group(1)}-01-01" if m_yr else "2020-01-01"
 
         extra = gather_extra(ws, r, hdr_r, 15)
         record = {
@@ -636,6 +789,8 @@ def parse_gl_lines(conn, ws, clean_wipe):
             "operating_temp": clean_str(ws.cell(r, 7).value),
             "t_min": clean_str(ws.cell(r, 11).value),
             "date_osi_last": d_last, "date_osi_next": d_next,
+            "date_osi_last_raw": raw_last, "date_osi_next_raw": raw_next,
+            "status_osi_next": status_osi_n,
             "remaining_life": clean_str(ws.cell(r, 15).value),
             "remarks": clean_str(ws.cell(r, 12).value),
         }
@@ -736,6 +891,12 @@ CREATE TABLE IF NOT EXISTS assets (
     date_osi_next TEXT,
     date_internal_last TEXT,
     date_internal_next TEXT,
+    date_osi_last_raw TEXT,
+    date_osi_next_raw TEXT,
+    date_internal_last_raw TEXT,
+    date_internal_next_raw TEXT,
+    status_osi_next TEXT,
+    status_internal_next TEXT,
     next_insp_category TEXT,
     corrosion_rate TEXT,
     remaining_life TEXT,
@@ -772,25 +933,25 @@ CREATE INDEX IF NOT EXISTS idx_assets_date_osi_next ON assets(date_osi_next);
 CREATE INDEX IF NOT EXISTS idx_assets_date_internal_next ON assets(date_internal_next);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(
-    name, tag, asset_number, description, remarks, sn, fluid_service, field,
+    name, tag, asset_number, description, remarks, sn, fluid_service, field, unit_name, plant, location,
     content='assets', content_rowid='id'
 );
 
 CREATE TRIGGER IF NOT EXISTS assets_ai AFTER INSERT ON assets BEGIN
-  INSERT INTO assets_fts(rowid, name, tag, asset_number, description, remarks, sn, fluid_service, field)
-  VALUES (new.id, new.name, new.tag, new.asset_number, new.description, new.remarks, new.sn, new.fluid_service, new.field);
+  INSERT INTO assets_fts(rowid, name, tag, asset_number, description, remarks, sn, fluid_service, field, unit_name, plant, location)
+  VALUES (new.id, new.name, new.tag, new.asset_number, new.description, new.remarks, new.sn, new.fluid_service, new.field, new.unit_name, new.plant, new.location);
 END;
 
 CREATE TRIGGER IF NOT EXISTS assets_ad AFTER DELETE ON assets BEGIN
-  INSERT INTO assets_fts(assets_fts, rowid, name, tag, asset_number, description, remarks, sn, fluid_service, field)
-  VALUES ('delete', old.id, old.name, old.tag, old.asset_number, old.description, old.remarks, old.sn, old.fluid_service, old.field);
+  INSERT INTO assets_fts(assets_fts, rowid, name, tag, asset_number, description, remarks, sn, fluid_service, field, unit_name, plant, location)
+  VALUES ('delete', old.id, old.name, old.tag, old.asset_number, old.description, old.remarks, old.sn, old.fluid_service, old.field, old.unit_name, old.plant, old.location);
 END;
 
 CREATE TRIGGER IF NOT EXISTS assets_au AFTER UPDATE ON assets BEGIN
-  INSERT INTO assets_fts(assets_fts, rowid, name, tag, asset_number, description, remarks, sn, fluid_service, field)
-  VALUES ('delete', old.id, old.name, old.tag, old.asset_number, old.description, old.remarks, old.sn, old.fluid_service, old.field);
-  INSERT INTO assets_fts(rowid, name, tag, asset_number, description, remarks, sn, fluid_service, field)
-  VALUES (new.id, new.name, new.tag, new.asset_number, new.description, new.remarks, new.sn, new.fluid_service, new.field);
+  INSERT INTO assets_fts(assets_fts, rowid, name, tag, asset_number, description, remarks, sn, fluid_service, field, unit_name, plant, location)
+  VALUES ('delete', old.id, old.name, old.tag, old.asset_number, old.description, old.remarks, old.sn, old.fluid_service, old.field, old.unit_name, old.plant, old.location);
+  INSERT INTO assets_fts(rowid, name, tag, asset_number, description, remarks, sn, fluid_service, field, unit_name, plant, location)
+  VALUES (new.id, new.name, new.tag, new.asset_number, new.description, new.remarks, new.sn, new.fluid_service, new.field, new.unit_name, new.plant, new.location);
 END;
 
 CREATE TABLE IF NOT EXISTS temp_repairs (
@@ -878,20 +1039,40 @@ def import_workbook(xlsx_path, db_path, clean_wipe=False):
     wb = openpyxl.load_workbook(xlsx_path, data_only=True)
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.executescript(SCHEMA)
 
     if clean_wipe:
-        print("  [*] Wiping existing database tables for clean import...")
-        conn.execute("DELETE FROM assets")
-        conn.execute("DELETE FROM temp_repairs")
-        conn.execute("DELETE FROM critical_assets")
-        conn.execute("DELETE FROM inspection_log")
-        conn.execute("DELETE FROM raw_rows")
-        try:
-            conn.execute("DELETE FROM assets_fts")
-        except Exception:
-            pass
+        print("  [*] Dropping existing database tables for clean import...")
+        conn.execute("DROP TRIGGER IF EXISTS assets_ai")
+        conn.execute("DROP TRIGGER IF EXISTS assets_ad")
+        conn.execute("DROP TRIGGER IF EXISTS assets_au")
+        conn.execute("DROP TABLE IF EXISTS assets_fts")
+        conn.execute("DROP TABLE IF EXISTS assets")
+        conn.execute("DROP TABLE IF EXISTS temp_repairs")
+        conn.execute("DROP TABLE IF EXISTS critical_assets")
+        conn.execute("DROP TABLE IF EXISTS inspection_log")
+        conn.execute("DROP TABLE IF EXISTS raw_rows")
         conn.commit()
+
+    conn.executescript(SCHEMA)
+
+    # Ensure all columns exist even if tables were already present
+    cur = conn.cursor()
+    asset_cols = [r[1] for r in cur.execute("PRAGMA table_info(assets)").fetchall()]
+    new_cols = [
+        ("date_osi_last_raw", "TEXT"),
+        ("date_osi_next_raw", "TEXT"),
+        ("date_internal_last_raw", "TEXT"),
+        ("date_internal_next_raw", "TEXT"),
+        ("status_osi_next", "TEXT"),
+        ("status_internal_next", "TEXT"),
+    ]
+    for col_name, col_type in new_cols:
+        if col_name not in asset_cols:
+            try:
+                cur.execute(f"ALTER TABLE assets ADD COLUMN {col_name} {col_type}")
+            except Exception:
+                pass
+    conn.commit()
 
     total_assets = 0
     total_temp_repairs = 0
@@ -934,7 +1115,7 @@ def import_workbook(xlsx_path, db_path, clean_wipe=False):
 def main():
     clean = "--clean" in sys.argv or "-c" in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    xlsx = args[0] if len(args) > 0 else "1. Master Inspection Plan - Updated 4-6-2026.xlsx"
+    xlsx = args[0] if len(args) > 0 else "1. Master Inspection Plan.xlsx"
     db = args[1] if len(args) > 1 else "inspection_plan.db"
     
     if not os.path.exists(xlsx):
@@ -946,6 +1127,24 @@ def main():
             sys.exit(1)
 
     import_workbook(xlsx, db, clean_wipe=clean)
+
+    # Check for refined campaign plan cross-reference
+    refined_xlsx = "refined plan.xlsx"
+    if not os.path.exists(refined_xlsx):
+        # Look in the same directory as the master xlsx
+        cand = os.path.join(os.path.dirname(xlsx), "refined plan.xlsx")
+        if os.path.exists(cand):
+            refined_xlsx = cand
+        else:
+            refined_xlsx = None
+
+    if refined_xlsx and os.path.exists(refined_xlsx):
+        print(f"\n[+] Detected tactical campaign plan: {refined_xlsx}")
+        try:
+            from import_refined_plan import import_refined_plan
+            import_refined_plan(refined_xlsx, db)
+        except Exception as e:
+            print(f"  [!] Note: Refined plan import encountered: {e}")
 
 
 if __name__ == "__main__":
