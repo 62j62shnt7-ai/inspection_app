@@ -13,6 +13,12 @@ import datetime
 import re
 import contextlib
 
+# Prefer the openpyxl bundled with the app (python/site-packages) so the
+# importer works even when openpyxl isn't installed system-wide.
+_BUNDLED_SITE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "python", "site-packages")
+if os.path.isdir(_BUNDLED_SITE) and _BUNDLED_SITE not in sys.path:
+    sys.path.append(_BUNDLED_SITE)
+
 try:
     import openpyxl
 except ImportError:
@@ -1100,6 +1106,12 @@ def import_workbook(xlsx_path, db_path, clean_wipe=False):
                 print(f"  [+] {sheet_name:28s} -> {count:4d} assets mapped & synchronized")
 
     conn.commit()
+    # Ensure all commits are in the main DB file, not left in the WAL (the
+    # app removes stale sidecar files after import to avoid replaying them).
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        pass
     conn.close()
 
     print(f"\n-------------------------------------------------------")

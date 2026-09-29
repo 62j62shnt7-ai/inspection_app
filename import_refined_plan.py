@@ -12,6 +12,12 @@ import os
 import re
 import sqlite3
 import datetime
+
+# Prefer the openpyxl bundled with the app (python/site-packages).
+_BUNDLED_SITE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "python", "site-packages")
+if os.path.isdir(_BUNDLED_SITE) and _BUNDLED_SITE not in sys.path:
+    sys.path.append(_BUNDLED_SITE)
+
 import openpyxl
 
 SCHEMA_REFINED = """
@@ -525,6 +531,10 @@ def import_refined_plan(xlsx_path="refined plan.xlsx", db_path="inspection_plan.
         count += 1
 
     conn.commit()
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except Exception:
+        pass
     conn.close()
 
     rate = (matched_count / count * 100) if count else 0

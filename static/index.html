@@ -72,7 +72,7 @@
       <div class="compliance-banner" id="complianceBanner">
         <div class="compliance-metric">
           <div class="metric-val" id="kpiComplianceRate">--%</div>
-          <div class="metric-lbl">Inspection Compliance Index</div>
+          <div class="metric-lbl" id="kpiComplianceLbl">Inspection Compliance (scheduled assets)</div>
         </div>
         <div class="compliance-divider"></div>
         <div class="compliance-metric">
@@ -105,6 +105,20 @@
         <div class="triage-grid" id="triageGrid"></div>
       </div>
 
+      <!-- Data Integrity Worklists -->
+      <div class="panel-grid">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>📋 Missing Due Dates — Data Quality Worklist</h2>
+              <span class="hint">Assets with no next-due date at all (excluded from compliance). High risk first — open one and set its dates.</span>
+            </div>
+            <span class="badge-count warning" id="noDueDateBadge">0</span>
+          </div>
+          <div id="noDueDateList" class="asset-table-wrap compact" style="max-height:340px;"></div>
+        </div>
+      </div>
+
       <!-- 5x5 RBI Matrix + High Risk Queue -->
       <div class="panel-grid matrix-grid-layout">
         <!-- 5x5 RBI Risk Matrix -->
@@ -129,6 +143,29 @@
             <span class="badge-count danger" id="highRiskCountBadge">0</span>
           </div>
           <div id="highRiskList" class="asset-table-wrap compact"></div>
+        </div>
+      </div>
+
+      <!-- Alerts: Overdue vs Temp Repairs vs Critical -->
+      <div class="panel-grid" style="margin-top:18px;">
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>🕓 Recent System Activity (Audit Trail)</h2>
+              <span class="hint">Every change to statutory data is recorded — who logged, deferred, synced or restored.</span>
+            </div>
+          </div>
+          <div id="auditList" class="asset-table-wrap compact" style="max-height:300px;"></div>
+        </div>
+
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>💾 Database Backups</h2>
+              <span class="hint">Automatic snapshots taken before destructive operations. Restoring takes a safety backup first.</span>
+            </div>
+          </div>
+          <div id="backupList" class="asset-table-wrap compact" style="max-height:300px;"></div>
         </div>
       </div>
 

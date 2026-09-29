@@ -58,6 +58,9 @@ function daysFromToday(iso) {
 }
 
 function statusPill(asset) {
+  if (asset.due_date_estimated && asset.overdue) {
+    return `<span class="status-pill deferred" title="Due date is an import placeholder (original cell had no parseable date) — excluded from aging stats">⚠️ ESTIMATED DATE</span>`;
+  }
   if (asset.is_deferred) {
     return `<span class="status-pill deferred" title="Approved MOC Deferral until ${asset.deferral_expiry || ''}">🛡️ DEFERRED (${fmtDate(asset.deferral_expiry)})</span>`;
   }
@@ -264,6 +267,53 @@ function bindRowClicks(container) {
   }
 }
 
+// ---------------------------------------------------------------- Audit & Backups
+async function loadAuditTrail() {
+  const el = document.getElementById("auditList");
+  if (!el) return;
+  try {
+    const rows = await api("/api/audit");
+    el.innerHTML = rows.length ? `<table class="assets"><tbody>
+      ${rows.slice(0, 20).map(r => `<tr>
+        <td style="white-space:nowrap; color:var(--text-faint);">${esc(r.ts)}</td>
+        <td style="white-space:nowrap;"><b>${esc(r.action)}</b></td>
+        <td>${esc(r.entity_type || "")}${r.entity_id ? " #" + esc(r.entity_id) : ""}</td>
+        <td style="color:var(--text-muted); font-size:11.5px;">${esc(r.details || "")}</td>
+      </tr>`).join("")}</tbody></table>`
+      : `<div style="color:var(--text-faint); font-size:12.5px; padding:10px;">No activity recorded yet. Every log, deferral, sync and restore will appear here.</div>`;
+  } catch { el.innerHTML = "<div style='color:var(--text-faint); padding:10px;'>Audit log unavailable.</div>"; }
+}
+
+async function loadBackups() {
+  const el = document.getElementById("backupList");
+  if (!el) return;
+  try {
+    const rows = await api("/api/backups");
+    el.innerHTML = rows.length ? `<table class="assets"><tbody>
+      ${rows.slice(0, 12).map(b => `<tr>
+        <td style="white-space:nowrap;">💾 ${esc(b.filename)}</td>
+        <td style="white-space:nowrap; color:var(--text-faint);">${esc(b.modified)} · ${b.size_mb} MB</td>
+        <td style="text-align:right;"><button class="btn ghost small" onclick="restoreBackup('${esc(b.filename)}')">Restore</button></td>
+      </tr>`).join("")}</tbody></table>`
+      : `<div style="color:var(--text-faint); font-size:12.5px; padding:10px;">No backups yet. One is taken automatically before sync-to-master, reimport or database clear.</div>`;
+  } catch { el.innerHTML = "<div style='color:var(--text-faint); padding:10px;'>Backup list unavailable.</div>"; }
+}
+
+window.restoreBackup = async function(filename) {
+  if (!confirm(`Restore database from "${filename}"?\n\nYour current data will be backed up first, then replaced.`)) return;
+  try {
+    const res = await api("/api/backups/restore", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({filename})
+    });
+    showToast(res.message || "Restored.");
+    loadDashboard();
+  } catch (err) {
+    showToast("Restore failed: " + err.message, true);
+  }
+};
+
 // ---------------------------------------------------------------- 5x5 RBI Matrix Heatmap
 const MATRIX_CELL_TIERS = {
   "5E": "rbi-high", "5D": "rbi-high", "4E": "rbi-high",
@@ -337,6 +387,13 @@ async function loadDashboard() {
     // 1. Executive Compliance Banner
     const kpiRate = document.getElementById("kpiComplianceRate");
     if (kpiRate) kpiRate.textContent = `${d.compliance_rate}%`;
+    const kpiRateLbl = document.getElementById("kpiComplianceLbl");
+    if (kpiRateLbl) {
+      const unrated = d.no_due_date_count || 0;
+      kpiRateLbl.textContent = unrated
+        ? `Inspection Compliance (${unrated} asset${unrated === 1 ? "" : "s"} unrated — no due date)`
+        : "Inspection Compliance (all assets scheduled)";
+    }
     const kpiUnmanaged = document.getElementById("kpiUnmanagedOverdue");
     if (kpiUnmanaged) kpiUnmanaged.textContent = d.aging_counts?.unmanaged_overdue ?? d.overdue_count;
     const kpiApproved = document.getElementById("kpiApprovedDeferrals");
@@ -408,6 +465,10 @@ async function loadDashboard() {
           <div class="n">${ac["approved_deferrals"]}</div>
           <div class="lbl">Approved MOC Deferrals</div>
         </div>
+        <div class="triage-card c-180-plus" onclick="filterByAging('')" style="opacity:0.85;" title="Overdue assets whose due date is an import placeholder — excluded from aging buckets">
+          <div class="n">${ac["estimated_date"] || 0}</div>
+          <div class="lbl">Estimated-Date Items ⚠</div>
+        </div>
       `;
     }
 
@@ -415,6 +476,27 @@ async function loadDashboard() {
     if (d.rbi_matrix) {
       render5x5Matrix(d.rbi_matrix);
     }
+
+    // 4b. Missing-due-date worklist
+    const noDueBadge = document.getElementById("noDueDateBadge");
+    if (noDueBadge) noDueBadge.textContent = d.no_due_date_count || 0;
+    const noDueEl = document.getElementById("noDueDateList");
+    if (noDueEl) {
+      const items = d.no_due_date || [];
+      noDueEl.innerHTML = items.length ? `<table class="assets"><thead><tr><th>Asset</th><th>Sheet</th><th>Risk</th><th>Last OSI</th></tr></thead><tbody>
+        ${items.slice(0, 25).map(a => `<tr data-id="${a.id}" style="cursor:pointer;" onclick="openAssetDrawer(${a.id})">
+          <td>${esc(a.name || a.tag || "—")}</td>
+          <td>${esc(a.source_sheet || "")}</td>
+          <td>${riskBadge(a)}</td>
+          <td>${esc(a.date_osi_last || "Never inspected")}</td>
+        </tr>`).join("")}</tbody></table>
+        ${items.length > 25 ? `<div style="color:var(--text-faint); font-size:12px; padding:8px;">+ ${items.length - 25} more — filter Assets view to clear them</div>` : ""}`
+        : `<div style="color:var(--text-faint); font-size:12.5px; padding:10px;">Every asset has a due date. 🎉</div>`;
+    }
+
+    // 4c. Audit trail + backups
+    loadAuditTrail();
+    loadBackups();
 
     // 5. High Risk List
     const highRiskEl = document.getElementById("highRiskList");
@@ -1055,6 +1137,8 @@ async function openAssetDrawer(id) {
           <button id="btnAddLog" class="btn primary">💾 Save Inspection Record</button>
         </div>
 
+        ${corrosionTrendHtml(a)}
+
         ${a.log && a.log.length ? `
           <div class="section-title">Historical Inspection & NDT Log</div>
           ${a.log.map(l => `<div class="log-entry">
@@ -1082,6 +1166,44 @@ async function openAssetDrawer(id) {
   } catch (err) {
     showToast("Failed to open asset details: " + err.message, true);
   }
+}
+
+// ---------------------------------------------------------------- Corrosion Trend
+function corrosionTrendHtml(asset) {
+  const readings = (asset.log || [])
+    .filter(l => l.t_actual && parseFloat(l.t_actual) > 0)
+    .map(l => ({date: l.insp_date, t: parseFloat(l.t_actual)}))
+    .filter(r => r.date)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  if (readings.length < 2) return "";
+
+  const first = readings[0], last = readings[readings.length - 1];
+  const days = (new Date(last.date) - new Date(first.date)) / 86400000;
+  const loss = first.t - last.t;
+  const years = days / 365.25;
+  const cr = years > 0 ? loss / years : 0;
+  const tMin = parseFloat(asset.t_min) || 0;
+  const rl = cr > 0 && tMin > 0 ? (last.t - tMin) / cr : (cr <= 0 ? 99 : 0);
+
+  let verdict, cls;
+  if (cr <= 0)      { verdict = "No measurable loss — establish a longer baseline before setting intervals"; cls = "var(--text-muted);"; }
+  else if (cr < 0.1)  { verdict = "Low corrosion rate"; cls = "var(--ok, #4ade80);"; }
+  else if (cr < 0.25) { verdict = "Moderate corrosion rate — monitor"; cls = "var(--amber);"; }
+  else              { verdict = "HIGH corrosion rate — shorten intervals"; cls = "var(--danger);"; }
+
+  return `
+    <div class="section-title">📉 Corrosion Trend (from logged thickness readings)</div>
+    <div class="calc-card" style="padding:12px 14px;">
+      <div class="field-grid">
+        <div class="calc-res-item"><div class="calc-res-val" style="font-size:16px;">${cr > 0 ? cr.toFixed(3) : "0"}</div><div class="calc-res-lbl">Avg CR (mm/yr)</div></div>
+        <div class="calc-res-item"><div class="calc-res-val" style="font-size:16px;">${loss > 0 ? loss.toFixed(2) : "0"}</div><div class="calc-res-lbl">Loss (mm)</div></div>
+        <div class="calc-res-item"><div class="calc-res-val" style="font-size:16px;">${years > 0 ? years.toFixed(1) : "—"}</div><div class="calc-res-lbl">Baseline (yrs)</div></div>
+        <div class="calc-res-item"><div class="calc-res-val" style="font-size:16px;">${rl >= 99 ? "99+" : rl.toFixed(1)}</div><div class="calc-res-lbl">Est. Remaining Life (yrs)</div></div>
+      </div>
+      <div style="margin-top:8px; font-size:12px; color:${cls};">${verdict} · ${readings.length} readings, ${esc(first.date)} → ${esc(last.date)}</div>
+      ${readings.map(r => `<div style="font-size:11.5px; color:var(--text-muted); margin-top:2px;">• ${esc(r.date)}: t = ${r.t} mm</div>`).join("")}
+    </div>`;
 }
 
 // ---------------------------------------------------------------- Calculator Functions

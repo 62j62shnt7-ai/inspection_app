@@ -3,3 +3,6 @@ __pycache__/
 *.bak.*
 .DS_Store
 *.db-journal
+*.db-wal
+*.db-shm
+backups/
