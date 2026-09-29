@@ -361,6 +361,17 @@
           <option value="osi">OSI (On-Stream) Only</option>
         </select>
 
+        <select id="carryOverFromFilter" title="Omit overdue carry-over items dated before this year">
+          <option value="">Carry-over: All Overdue</option>
+          <option value="2026">Omit before 2026</option>
+          <option value="2025">Omit before 2025</option>
+          <option value="2024">Omit before 2024</option>
+          <option value="2023">Omit before 2023</option>
+          <option value="2022">Omit before 2022</option>
+          <option value="2020">Omit before 2020</option>
+          <option value="2015">Omit before 2015</option>
+        </select>
+
         <button id="btnLoadYear" class="btn primary">Generate Plan</button>
         <button id="btnPrintYear" class="btn ghost">🖨️ Print Outage Report</button>
         <button id="btnExportYearlyExcel" class="btn success">📊 Export to Excel</button>

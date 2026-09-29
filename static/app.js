@@ -1480,12 +1480,15 @@ async function loadTempRepairs() {
 document.getElementById("btnLoadYear")?.addEventListener("click", loadYearlyPlan);
 document.getElementById("yearlySheetFilter")?.addEventListener("change", loadYearlyPlan);
 document.getElementById("yearlyTypeFilter")?.addEventListener("change", loadYearlyPlan);
+document.getElementById("carryOverFromFilter")?.addEventListener("change", loadYearlyPlan);
 document.getElementById("btnPrintYear")?.addEventListener("click", () => window.print());
 document.getElementById("btnExportYearlyExcel")?.addEventListener("click", () => {
   const y = document.getElementById("yearInput")?.value || new Date().getFullYear();
   const sheet = document.getElementById("yearlySheetFilter")?.value || "";
   const type = document.getElementById("yearlyTypeFilter")?.value || "all";
+  const carryFrom = document.getElementById("carryOverFromFilter")?.value || "";
   const params = new URLSearchParams({ year: y, sheet, type });
+  if (carryFrom) params.append("carry_over_from", carryFrom);
   window.location.href = `/api/yearly_plan/export.xlsx?` + params.toString();
 });
 
@@ -1497,6 +1500,8 @@ async function loadYearlyPlan() {
     const selectedSheet = sheetFilter ? sheetFilter.value : "";
     const typeFilter = document.getElementById("yearlyTypeFilter");
     const scopeType = typeFilter ? typeFilter.value : "all";
+    const carryFilter = document.getElementById("carryOverFromFilter");
+    const carryFrom = carryFilter ? carryFilter.value : "";
 
     // Ensure sheet options are populated if empty
     if (sheetFilter && (!sheetFilter.options || sheetFilter.options.length <= 1) && state.sheets && state.sheets.length) {
@@ -1512,6 +1517,9 @@ async function loadYearlyPlan() {
     if (selectedSheet) {
       params.append("sheet", selectedSheet);
     }
+    if (carryFrom) {
+      params.append("carry_over_from", carryFrom);
+    }
     
     const rows = await api(`/api/yearly_plan?` + params.toString());
     
@@ -1519,7 +1527,8 @@ async function loadYearlyPlan() {
     if (metaEl) {
       const scopeLabel = scopeType === "all" ? "All Scopes" : (scopeType === "internal" ? "Internal (Shutdown) Only" : "OSI (On-Stream) Only");
       const sheetLabel = selectedSheet ? `Sheet: ${selectedSheet}` : "All Sheets (Global)";
-      metaEl.textContent = `${rows.length} inspection event(s) scheduled for ${year} (${sheetLabel} · ${scopeLabel})`;
+      const carryLabel = carryFrom ? `Carry-over ≥ ${carryFrom}` : "All Overdue Carried";
+      metaEl.textContent = `${rows.length} inspection event(s) scheduled for ${year} (${sheetLabel} · ${scopeLabel} · ${carryLabel})`;
     }
     
     const el = document.getElementById("yearlyTableWrap");

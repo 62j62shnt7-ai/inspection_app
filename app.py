@@ -1092,8 +1092,21 @@ def api_yearly_plan(params):
         insp_type = "all"
     sheet = params.get("sheet", [""])[0].strip()
     include_overdue = params.get("include_overdue", ["1"])[0].strip().lower() not in ("0", "false", "no")
+    # Carry-over floor: optionally ignore overdue events older than this year.
+    # Anything before it is treated as unschedulable legacy data (e.g. the 2010-2019
+    # never-executed backlog) and left out of the plan entirely.
+    carry_over_from = None
+    raw_cof = params.get("carry_over_from", [""])[0].strip()
+    if raw_cof:
+        try:
+            carry_over_from = int(raw_cof)
+        except (TypeError, ValueError):
+            carry_over_from = None
+        if carry_over_from is not None and not (1990 <= carry_over_from <= 2100):
+            carry_over_from = None
     start = f"{year}-01-01"
     end = f"{year}-12-31"
+    carry_floor = f"{carry_over_from}-01-01" if carry_over_from else None
 
     query = "SELECT * FROM assets WHERE archived = 0"
     args = []
@@ -1113,13 +1126,20 @@ def api_yearly_plan(params):
         # overdue from BEFORE the year (statutory catch-up work must appear in
         # the plan — dropping it would hide the backlog from the very document
         # meant to schedule it). Placeholder estimated dates are not real
-        # commitments and are never auto-carried forward.
+        # commitments and are never auto-carried forward. With a carry-over
+        # floor set, overdue events older than the floor are omitted instead.
         def event_qualifies(nd):
             if not nd:
                 return False
             if start <= nd <= end:
                 return True
-            return include_overdue and nd < start and not r.get("due_date_estimated")
+            if not (include_overdue and nd < start):
+                return False
+            if r.get("due_date_estimated"):
+                return False
+            if carry_floor and nd < carry_floor:
+                return False
+            return True
 
         int_q = event_qualifies(int_n)
         osi_q = event_qualifies(osi_n)
@@ -1200,6 +1220,15 @@ def api_export_yearly_excel(params):
     # Meta / Summary Block
     scope_label = "All Inspection Scopes (Internal & OSI)" if insp_type == "all" else ("Internal (Shutdown) Only" if insp_type == "internal" else "OSI (On-Stream) Only")
     sheet_label = sheet if sheet else "All Sheets (Global Asset Register)"
+    # Re-derive the carry-over floor the same way the plan engine did.
+    raw_cof = params.get("carry_over_from", [""])[0].strip()
+    try:
+        cof_val = int(raw_cof) if raw_cof else None
+    except (TypeError, ValueError):
+        cof_val = None
+    if cof_val is not None and not (1990 <= cof_val <= 2100):
+        cof_val = None
+    carry_label = f"Carry-over floor: {cof_val}" if cof_val else "Carry-over: all overdue"
     gen_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     total_count = len(items)
@@ -1208,7 +1237,7 @@ def api_export_yearly_excel(params):
     high_count = sum(1 for it in items if it.get("risk_category") == "HIGH")
 
     meta_lines = [
-        ("A2", f"Target Scope: {scope_label}  |  System / Sheet: {sheet_label}"),
+        ("A2", f"Target Scope: {scope_label}  |  System / Sheet: {sheet_label}  |  {carry_label}"),
         ("A3", f"Generated: {gen_time}  |  Total Scheduled Assets: {total_count}  (Shutdown/Internal: {int_count} | On-Stream: {osi_count} | High Risk: {high_count})"),
     ]
     carry_count = sum(1 for it in items if it.get("plan_is_carry_over"))
