@@ -175,6 +175,238 @@ class TestPlaceholderFlags(unittest.TestCase):
         self.assertEqual(d["pof_score"], 3)
 
 
+class TestYearlyPlanLogic(unittest.TestCase):
+    """Yearly plan must be a true statutory plan: schedule the year's work AND
+    surface overdue backlog instead of silently dropping it."""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile
+        cls._tmpdir = tempfile.TemporaryDirectory()
+        cls._db = os.path.join(cls._tmpdir.name, "yearly.db")
+        cls._old_db_path = app.DB_PATH
+        cls._old_conn = app.CONN
+        app.DB_PATH = cls._db
+        # Build a minimal assets schema via the importer (it owns the DDL)
+        import import_excel
+        import sqlite3
+        conn = sqlite3.connect(cls._db)
+        conn.executescript(import_excel.SCHEMA)
+        conn.commit()
+        conn.close()
+        app.CONN = app.get_conn()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            app.CONN.close()
+        except Exception:
+            pass
+        app.DB_PATH = cls._old_db_path
+        app.CONN = cls._old_conn
+        cls._tmpdir.cleanup()
+
+    def _seed(self, **over):
+        row = {
+            "name": "Test Asset", "source_sheet": "Coolers", "archived": 0,
+            "date_osi_next": None, "date_internal_next": None,
+            "status_osi_next": "Scheduled", "status_internal_next": None,
+            "deferral_status": None, "deferral_expiry": None,
+        }
+        row.update(over)
+        cols = list(row.keys())
+        with app.CONN_LOCK:
+            cur = app.CONN.execute(
+                f"INSERT INTO assets ({', '.join(cols)}) VALUES ({', '.join('?' for _ in cols)})",
+                [row[c] for c in cols])
+            app.CONN.commit()
+            return cur.lastrowid
+
+    def _plan(self, **params):
+        qs = {k: [str(v)] for k, v in params.items()}
+        return app.api_yearly_plan(qs)
+
+    def test_scheduled_event_in_year(self):
+        aid = self._seed(date_osi_next="2026-06-15", name="In Year")
+        try:
+            plan = self._plan(year=2026)
+            self.assertTrue(any(p["id"] == aid for p in plan))
+        finally:
+            self._cleanup(aid)
+
+    def test_overdue_from_prior_year_is_carried_over(self):
+        # Due 2025-03: in the 2026 plan it must NOT vanish — it is statutory
+        # backlog and floats to the top as carry-over.
+        aid = self._seed(date_osi_next="2025-03-01", name="Backlog Item")
+        try:
+            plan = self._plan(year=2026)
+            item = next((p for p in plan if p["id"] == aid), None)
+            self.assertIsNotNone(item, "overdue item must appear in the next year's plan")
+            self.assertTrue(item["plan_is_carry_over"])
+            self.assertEqual(item["plan_date"], "2025-03-01")
+            # ...and must sort ahead of any in-year item
+            if plan and plan[0]["id"] != aid:
+                self.assertLessEqual(plan[0]["plan_date"], item["plan_date"])
+        finally:
+            self._cleanup(aid)
+
+    def test_overdue_can_be_excluded(self):
+        aid = self._seed(date_osi_next="2025-03-01", name="Backlog Excl")
+        try:
+            plan = self._plan(year=2026, include_overdue=0)
+            self.assertFalse(any(p["id"] == aid for p in plan))
+        finally:
+            self._cleanup(aid)
+
+    def test_placeholder_estimated_date_never_carried(self):
+        # The importer's 2020-01-01 placeholder is not a real commitment.
+        aid = self._seed(date_osi_next=app.PLACEHOLDER_DATE, name="Placeholder")
+        try:
+            plan_2026 = self._plan(year=2026)
+            self.assertFalse(any(p["id"] == aid for p in plan_2026),
+                             "placeholder dates must not inflate carry-over backlog")
+        finally:
+            self._cleanup(aid)
+
+    def test_junk_year_falls_back_to_current(self):
+        plan_junk = self._plan(year="20x6!")
+        plan_now = self._plan(year=str(datetime.date.today().year))
+        self.assertEqual(len(plan_junk), len(plan_now))
+
+    def test_type_filter_internal(self):
+        a1 = self._seed(date_osi_next="2026-05-01", name="OSI Only")
+        a2 = self._seed(date_internal_next="2026-05-02", name="Internal Only")
+        try:
+            plan = self._plan(year=2026, type="internal")
+            self.assertFalse(any(p["id"] == a1 for p in plan))
+            self.assertTrue(any(p["id"] == a2 for p in plan))
+        finally:
+            self._cleanup(a1, a2)
+
+    def test_archived_assets_excluded(self):
+        aid = self._seed(date_osi_next="2026-05-01", name="Archived", archived=1)
+        try:
+            plan = self._plan(year=2026)
+            self.assertFalse(any(p["id"] == aid for p in plan))
+        finally:
+            self._cleanup(aid)
+
+    def _cleanup(self, *ids):
+        with app.CONN_LOCK:
+            app.CONN.execute(
+                f"DELETE FROM assets WHERE id IN ({', '.join('?' for _ in ids)})", ids)
+            try:
+                app.CONN.execute(
+                    f"DELETE FROM assets_fts WHERE rowid IN ({', '.join('?' for _ in ids)})", ids)
+            except Exception:
+                pass
+            app.CONN.commit()
+
+
+class TestReconciliationLogic(unittest.TestCase):
+    """Campaign reconciliation: scope classification, sync semantics, and
+    progress-denominator integrity."""
+
+    def test_internal_scope_classification(self):
+        # Full campaign scope vocabulary; SD/NSD/Internal = shutdown scopes.
+        for scope in ("SD/Internal", "NSD/Internal", "Internal", "internal"):
+            self.assertTrue(app._is_internal_scope(scope), scope)
+        for scope in ("OSI", "OSI-ADV", "UT + VT", "PT + VT", None, ""):
+            self.assertFalse(app._is_internal_scope(scope), str(scope))
+
+    def test_sync_does_not_overwrite_variance_baseline(self):
+        # Sync must mark items synced WITHOUT rewriting date_variance_days —
+        # the planned-vs-original-statutory baseline is the audit trail.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "t.db")
+            open(db, "w").close()
+            old_db, old_conn = app.DB_PATH, app.CONN
+            app.DB_PATH = db
+            try:
+                import import_excel
+                import sqlite3
+                conn = sqlite3.connect(db)
+                conn.executescript(import_excel.SCHEMA)
+                # app.get_conn() owns the refined_plan_items DDL
+                app.CONN = app.get_conn()
+                app.CONN.close()
+                conn = sqlite3.connect(db)
+                conn.executescript(import_excel.SCHEMA)
+                conn.commit()
+                conn.close()
+                app.CONN = app.get_conn()
+                with app.CONN_LOCK:
+                    aid = app.CONN.execute(
+                        "INSERT INTO assets (name, date_osi_next) VALUES ('V', '2030-01-01')"
+                    ).lastrowid
+                    app.CONN.execute("""
+                        INSERT INTO refined_plan_items (asset_id, planned_insp_date,
+                            scope_category, ut_progress, date_variance_days)
+                        VALUES (?, '2025-06-01', 'OSI', 'Done', -578)
+                    """, (aid,))
+                    app.CONN.commit()
+                app.api_sync_completed_to_master()
+                with app.CONN_LOCK:
+                    item = app.CONN.execute(
+                        "SELECT synced_to_master, date_variance_days FROM refined_plan_items"
+                    ).fetchone()
+                self.assertEqual(item["synced_to_master"], 1)
+                self.assertEqual(item["date_variance_days"], -578,
+                                 "sync must preserve the original baseline variance")
+                # And the asset OSI must be advanced 5y from the campaign date.
+                with app.CONN_LOCK:
+                    a = app.CONN.execute(
+                        "SELECT date_osi_next FROM assets WHERE id = ?", (aid,)).fetchone()
+                self.assertEqual(a["date_osi_next"], "2030-06-01")
+            finally:
+                try:
+                    app.CONN.close()
+                except Exception:
+                    pass
+                app.DB_PATH, app.CONN = old_db, old_conn
+
+    def test_sync_never_moves_dates_backwards(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            db = os.path.join(td, "t.db")
+            open(db, "w").close()
+            old_db, old_conn = app.DB_PATH, app.CONN
+            app.DB_PATH = db
+            try:
+                import import_excel
+                import sqlite3
+                conn = sqlite3.connect(db)
+                conn.executescript(import_excel.SCHEMA)
+                conn.commit()
+                conn.close()
+                app.CONN = app.get_conn()
+                with app.CONN_LOCK:
+                    aid = app.CONN.execute(
+                        "INSERT INTO assets (name, date_osi_next) VALUES ('V', '2031-01-01')"
+                    ).lastrowid
+                    # Old campaign record planned 2025 — syncing it must NOT
+                    # regress the asset from 2031 back to 2030.
+                    app.CONN.execute("""
+                        INSERT INTO refined_plan_items (asset_id, planned_insp_date,
+                            scope_category, ut_progress)
+                        VALUES (?, '2025-06-01', 'OSI', 'Done')
+                    """, (aid,))
+                    app.CONN.commit()
+                app.api_sync_completed_to_master()
+                with app.CONN_LOCK:
+                    a = app.CONN.execute(
+                        "SELECT date_osi_next FROM assets WHERE id = ?", (aid,)).fetchone()
+                self.assertEqual(a["date_osi_next"], "2031-01-01",
+                                 "stale campaign record must not move dates backwards")
+            finally:
+                try:
+                    app.CONN.close()
+                except Exception:
+                    pass
+                app.DB_PATH, app.CONN = old_db, old_conn
+
+
 class TestFreshSchemaReconciliation(unittest.TestCase):
     """A DB created by app.py alone (no refined import yet) must not 500."""
 

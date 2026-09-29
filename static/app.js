@@ -200,6 +200,9 @@ function assetRowHtml(a, compact) {
       <span class="badge-scope ${a.plan_insp_type.toLowerCase().includes('internal') ? 'internal' : (a.plan_insp_type.toLowerCase().includes('osi') ? 'osi' : 'both')}">
         🗓️ Planned: ${esc(a.plan_insp_type)} (${fmtDate(a.plan_date)})
       </span>
+      ${a.plan_is_carry_over ? `<span class="badge-scope" style="background:#7f1d1d; color:#fecaca; margin-left:4px;">⚠ OVERDUE CARRY-OVER</span>` : ""}
+      ${a.plan_is_deferred ? `<span class="badge-scope" style="background:#78350f; color:#fde68a; margin-left:4px;">DEFERRED</span>` : ""}
+      ${a.plan_is_estimated && !a.plan_is_carry_over ? `<span class="badge-scope" style="background:#374151; color:#d1d5db; margin-left:4px;">ESTIMATED DATE</span>` : ""}
     </div>` : "";
 
   const timelineContent = (osiHtml || intHtml) ? (planScopeHtml + osiHtml + intHtml) : `<span style="color:var(--text-muted); font-size:12px;">No schedule recorded</span>`;
@@ -1743,8 +1746,17 @@ function renderProgressBadge(val) {
   if (lower === "holding") {
     return `<span class="badge-progress holding">⏳ HOLDING</span>`;
   }
-  if (lower.includes("survice") || lower.includes("service") || lower.includes("oos")) {
+  if (lower.includes("survice") || lower.includes("out of") || lower.includes("service") || lower.includes("oos")) {
     return `<span class="badge-progress oos">OUT OF SERVICE</span>`;
+  }
+  if (lower.includes("replaced")) {
+    return `<span class="badge-progress oos">REPLACED</span>`;
+  }
+  // Junk text (data-entry artifacts like 'tubing material') must not look like
+  // a real progress value — render it as neutral data, not a progress badge.
+  const known = ["done", "holding", "survice", "out of", "service", "oos", "replaced"];
+  if (!known.some(k => lower.includes(k))) {
+    return `<span class="badge-progress" style="background:rgba(255,255,255,0.04); color:var(--text-faint); border:1px dashed rgba(255,255,255,0.15);" title="Unrecognized value — check source data">${esc(v)}</span>`;
   }
   return `<span class="badge-progress" style="background:rgba(0,210,255,0.12); color:var(--accent);">${esc(v)}</span>`;
 }

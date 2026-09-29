@@ -807,6 +807,22 @@ def api_clear_reconciliation():
     }
 
 
+# Campaign scope strings that mean a SHUTDOWN (internal) inspection.
+# Everything else ('OSI', 'OSI-ADV', 'UT + VT', 'PT + VT', blank) is on-stream.
+INTERNAL_SCOPE_KEYWORDS = ("INTERNAL", "SD", "NSD")
+
+
+def _is_internal_scope(scope_category):
+    """Classify a campaign scope string as internal (shutdown) vs on-stream.
+
+    Matches the full-scope vocabulary in refined plan.xlsx: 'SD/Internal',
+    'NSD/Internal', 'Internal' are shutdown scopes; 'OSI', 'OSI-ADV',
+    'UT + VT', 'PT + VT' are on-stream.
+    """
+    s = (scope_category or "").upper()
+    return any(k in s for k in INTERNAL_SCOPE_KEYWORDS)
+
+
 def api_sync_completed_to_master():
     """
     Bulk synchronize completed inspections from the reconciled campaign into the Master Plan.
@@ -836,18 +852,23 @@ def api_sync_completed_to_master():
                    ut_progress, report_issued, remarks
             FROM refined_plan_items
             WHERE asset_id IS NOT NULL
+              AND synced_to_master = 0
               AND (
                 LOWER(ut_progress) LIKE '%done%' OR 
                 LOWER(report_issued) LIKE '%done%' OR
                 LOWER(ut_progress) LIKE '%completed%'
+              )
+              AND NOT (
+                COALESCE(ut_progress, '') LIKE '%out of%' OR COALESCE(report_issued, '') LIKE '%out of%'
+                OR COALESCE(ut_progress, '') LIKE '%replaced%' OR COALESCE(report_issued, '') LIKE '%replaced%'
+                OR COALESCE(ut_progress, '') LIKE '%tubing%' OR COALESCE(report_issued, '') LIKE '%tubing%'
               )
         """).fetchall()
 
         for item in items:
             item_id = item["id"]
             asset_id = item["asset_id"]
-            scope_cat = (item["scope_category"] or "").upper()
-            is_internal = "INTERNAL" in scope_cat or "SD" in scope_cat
+            is_internal = _is_internal_scope(item["scope_category"])
             insp_type = "Internal" if is_internal else "OSI"
 
             # The inspection that completed is the CAMPAIGN inspection!
@@ -909,32 +930,35 @@ def api_sync_completed_to_master():
                 ))
 
             # Update asset statutory dates and advance next due date (officially clears overdue!)
+            # Only advance the specific statutory track this scope covers, and
+            # never move the date BACKWARDS (an older campaign record re-synced
+            # later must not regress an already-advanced schedule).
             if is_internal:
                 CONN.execute("""
                     UPDATE assets 
-                    SET date_internal_last = ?, date_internal_next = ?, status_internal_next = 'Scheduled'
+                    SET date_internal_last = MAX(COALESCE(date_internal_last, ''), ?),
+                        date_internal_next = MAX(COALESCE(date_internal_next, ''), ?),
+                        status_internal_next = 'Scheduled'
                     WHERE id = ?
                 """, (insp_date, calc_next, asset_id))
             else:
                 CONN.execute("""
                     UPDATE assets 
-                    SET date_osi_last = ?, date_osi_next = ?, status_osi_next = 'Scheduled'
+                    SET date_osi_last = MAX(COALESCE(date_osi_last, ''), ?),
+                        date_osi_next = MAX(COALESCE(date_osi_next, ''), ?),
+                        status_osi_next = 'Scheduled'
                     WHERE id = ?
                 """, (insp_date, calc_next, asset_id))
 
-            # Mark campaign item as synced to master and recalculate variance days
-            try:
-                p_dt = datetime.date.fromisoformat(insp_date)
-                n_dt = datetime.date.fromisoformat(calc_next)
-                v_days = (p_dt - n_dt).days
-            except Exception:
-                v_days = 0
-
+            # Mark campaign item as synced to master. KEEP the original
+            # plan-vs-statutory baseline variance: overwriting it with
+            # planned-minus-new-next-due would report a fake -3650d for
+            # every 10y-interval asset and destroy the reconciliation KPIs.
             CONN.execute("""
                 UPDATE refined_plan_items
-                SET synced_to_master = 1, synced_at = datetime('now'), date_variance_days = ?
+                SET synced_to_master = 1, synced_at = datetime('now')
                 WHERE id = ?
-            """, (v_days, item_id))
+            """, (item_id,))
 
             synced_count += 1
             updated_assets.add(asset_id)
@@ -1054,9 +1078,20 @@ def api_update_critical_asset(critical_id, payload):
 
 
 def api_yearly_plan(params):
-    year = params.get("year", [str(datetime.date.today().year)])[0]
+    # Year must be a sane integer: string comparisons on a junk value silently
+    # yield an empty plan, and the raw value flows into the Excel filename.
+    try:
+        year = int(str(params.get("year", [str(datetime.date.today().year)])[0]).strip())
+    except (TypeError, ValueError):
+        year = datetime.date.today().year
+    if not (1990 <= year <= 2100):
+        year = datetime.date.today().year
+
     insp_type = params.get("type", ["all"])[0].strip().lower()
+    if insp_type not in ("all", "internal", "osi"):
+        insp_type = "all"
     sheet = params.get("sheet", [""])[0].strip()
+    include_overdue = params.get("include_overdue", ["1"])[0].strip().lower() not in ("0", "false", "no")
     start = f"{year}-01-01"
     end = f"{year}-12-31"
 
@@ -1074,29 +1109,47 @@ def api_yearly_plan(params):
         int_n = r.get("date_internal_next")
         osi_n = r.get("date_osi_next")
 
-        int_in_year = bool(int_n and start <= int_n <= end)
-        osi_in_year = bool(osi_n and start <= osi_n <= end)
+        # An event qualifies if scheduled inside the plan year, or if it is
+        # overdue from BEFORE the year (statutory catch-up work must appear in
+        # the plan — dropping it would hide the backlog from the very document
+        # meant to schedule it). Placeholder estimated dates are not real
+        # commitments and are never auto-carried forward.
+        def event_qualifies(nd):
+            if not nd:
+                return False
+            if start <= nd <= end:
+                return True
+            return include_overdue and nd < start and not r.get("due_date_estimated")
 
-        if insp_type == "internal" and not int_in_year:
+        int_q = event_qualifies(int_n)
+        osi_q = event_qualifies(osi_n)
+
+        if insp_type == "internal" and not int_q:
             continue
-        if insp_type == "osi" and not osi_in_year:
+        if insp_type == "osi" and not osi_q:
             continue
-        if not int_in_year and not osi_in_year:
+        if not int_q and not osi_q:
             continue
 
         item = dict(r)
-        if int_in_year and osi_in_year:
+        if int_q and osi_q:
             item["plan_insp_type"] = "Both (Internal & OSI)"
             item["plan_date"] = min(int_n, osi_n)
-        elif int_in_year:
+        elif int_q:
             item["plan_insp_type"] = "Internal"
             item["plan_date"] = int_n
         else:
             item["plan_insp_type"] = "OSI"
             item["plan_date"] = osi_n
 
+        # Plan-status flags so planners can see WHY an item is in the plan.
+        item["plan_is_carry_over"] = bool(item["plan_date"] and item["plan_date"] < start)
+        item["plan_is_deferred"] = bool(r.get("is_deferred"))
+        item["plan_is_estimated"] = bool(r.get("due_date_estimated"))
+
         plan.append(item)
 
+    # Earliest first: carry-over (overdue) work naturally floats to the top.
     plan.sort(key=lambda r: (r["plan_date"] or "", r.get("name") or ""))
     return plan
 
@@ -1106,11 +1159,18 @@ def api_export_yearly_excel(params):
     from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
     from openpyxl.utils import get_column_letter
 
-    year = params.get("year", [str(datetime.date.today().year)])[0]
+    items = api_yearly_plan(params)
+    # Re-derive the sanitized year exactly as the plan engine did, so the
+    # exported filename/title can never carry junk from the query string.
+    raw_year = params.get("year", [str(datetime.date.today().year)])[0]
+    try:
+        year = int(str(raw_year).strip())
+    except (TypeError, ValueError):
+        year = datetime.date.today().year
+    if not (1990 <= year <= 2100):
+        year = datetime.date.today().year
     insp_type = params.get("type", ["all"])[0].strip().lower()
     sheet = params.get("sheet", [""])[0].strip()
-
-    items = api_yearly_plan(params)
 
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -1130,7 +1190,7 @@ def api_export_yearly_excel(params):
     )
 
     # Title Block
-    ws.merge_cells("A1:N1")
+    ws.merge_cells("A1:O1")
     ws["A1"] = f"STATUTORY INSPECTION PLAN — {year}"
     ws["A1"].font = Font(name="Segoe UI", size=15, bold=True, color=WHITE)
     ws["A1"].fill = PatternFill(start_color=NAVY_HEADER, end_color=NAVY_HEADER, fill_type="solid")
@@ -1151,9 +1211,14 @@ def api_export_yearly_excel(params):
         ("A2", f"Target Scope: {scope_label}  |  System / Sheet: {sheet_label}"),
         ("A3", f"Generated: {gen_time}  |  Total Scheduled Assets: {total_count}  (Shutdown/Internal: {int_count} | On-Stream: {osi_count} | High Risk: {high_count})"),
     ]
+    carry_count = sum(1 for it in items if it.get("plan_is_carry_over"))
+    deferred_count = sum(1 for it in items if it.get("plan_is_deferred"))
+    meta_lines[1] = (meta_lines[1][0], meta_lines[1][1] +
+                     f"  |  Carry-over (overdue): {carry_count} | Deferred: {deferred_count}")
+
     for cell_ref, text in meta_lines:
         row_num = int(cell_ref[1:])
-        ws.merge_cells(f"A{row_num}:N{row_num}")
+        ws.merge_cells(f"A{row_num}:O{row_num}")
         ws[cell_ref] = text
         ws[cell_ref].font = Font(name="Segoe UI", size=10, italic=True, color="475569")
         ws[cell_ref].alignment = Alignment(horizontal="left", vertical="center")
@@ -1167,6 +1232,7 @@ def api_export_yearly_excel(params):
         ("#", 6),
         ("Scheduled Date", 16),
         ("Inspection Scope", 22),
+        ("Plan Status", 24),
         ("Asset Tag", 16),
         ("Equipment Name", 38),
         ("System / Sheet", 18),
@@ -1215,10 +1281,20 @@ def api_export_yearly_excel(params):
         cui_val = "YES" if item.get("is_cui") else "NO"
         remarks_val = item.get("remarks") or ""
 
+        status_flags = []
+        if item.get("plan_is_carry_over"):
+            status_flags.append("Carry-over (overdue)")
+        if item.get("plan_is_deferred"):
+            status_flags.append("Deferred")
+        if item.get("plan_is_estimated"):
+            status_flags.append("Estimated date")
+        plan_status = " · ".join(status_flags) if status_flags else "Scheduled"
+
         row_data = [
             row_idx - 5,
             item.get("plan_date") or "",
             item.get("plan_insp_type") or "",
+            plan_status,
             tag_val,
             item.get("name") or "",
             item.get("source_sheet") or "",
@@ -1239,21 +1315,33 @@ def api_export_yearly_excel(params):
             cell.border = thin_border
 
             # Alignment rules
-            if col_idx in (1, 2, 10, 11, 12, 13):
+            if col_idx in (1, 2, 5, 10, 11, 12, 13, 14):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
-            elif col_idx in (3, 4, 9):
+            elif col_idx == 4:
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+            elif col_idx in (3, 9):
                 cell.alignment = Alignment(horizontal="center", vertical="center")
             else:
                 cell.alignment = Alignment(horizontal="left", vertical="center")
 
+            # Plan-status highlight: overdue carry-over is the actionable alarm,
+            # deferred work is a warning.
+            if col_idx == 4:
+                if item.get("plan_is_carry_over"):
+                    cell.fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
+                    cell.font = Font(name="Segoe UI", size=9.5, bold=True, color="991B1B")
+                elif item.get("plan_is_deferred"):
+                    cell.fill = PatternFill(start_color="FEF3C7", end_color="FEF3C7", fill_type="solid")
+                    cell.font = Font(name="Segoe UI", size=9.5, bold=True, color="92400E")
+
             # Risk pill styling
-            if col_idx == 10 and risk_val in risk_colors:
+            if col_idx == 11 and risk_val in risk_colors:
                 rc = risk_colors[risk_val]
                 cell.fill = PatternFill(start_color=rc["fill"], end_color=rc["fill"], fill_type="solid")
                 cell.font = Font(name="Segoe UI", size=9.5, bold=True, color=rc["text"])
 
             # CUI highlight
-            if col_idx == 11 and cui_val == "YES":
+            if col_idx == 12 and cui_val == "YES":
                 cell.fill = PatternFill(start_color="FEE2E2", end_color="FEE2E2", fill_type="solid")
                 cell.font = Font(name="Segoe UI", size=9.5, bold=True, color="991B1B")
 
@@ -1294,10 +1382,24 @@ def api_get_reconciliation():
         delayed = cur.execute("SELECT count(*) FROM refined_plan_items WHERE date_variance_days > 60").fetchone()[0]
         proactive = cur.execute("SELECT count(*) FROM refined_plan_items WHERE date_variance_days < -60").fetchone()[0]
         aligned = cur.execute("SELECT count(*) FROM refined_plan_items WHERE date_variance_days IS NOT NULL AND abs(date_variance_days) <= 60").fetchone()[0]
-        
-        ut_done = cur.execute("SELECT count(*) FROM refined_plan_items WHERE ut_progress = 'Done'").fetchone()[0]
-        ut_holding = cur.execute("SELECT count(*) FROM refined_plan_items WHERE ut_progress = 'holding'").fetchone()[0]
-        rep_issued = cur.execute("SELECT count(*) FROM refined_plan_items WHERE report_issued = 'Done'").fetchone()[0]
+
+        ut_done = cur.execute("SELECT count(*) FROM refined_plan_items WHERE LOWER(COALESCE(ut_progress,'')) LIKE '%done%'").fetchone()[0]
+        ut_holding = cur.execute("SELECT count(*) FROM refined_plan_items WHERE LOWER(COALESCE(ut_progress,'')) = 'holding'").fetchone()[0]
+        rep_issued = cur.execute("SELECT count(*) FROM refined_plan_items WHERE LOWER(COALESCE(report_issued,'')) LIKE '%done%'").fetchone()[0]
+
+        # Progress denominator: actionable campaign items only. Out-of-service,
+        # replaced, and junk-text rows ('tubing material') can never be executed
+        # and would silently deflate the completion percentages.
+        excluded = cur.execute("""
+            SELECT count(*) FROM refined_plan_items
+            WHERE LOWER(COALESCE(ut_progress,'')) LIKE '%out of%'
+               OR LOWER(COALESCE(report_issued,'')) LIKE '%out of%'
+               OR LOWER(COALESCE(ut_progress,'')) LIKE '%replaced%'
+               OR LOWER(COALESCE(report_issued,'')) LIKE '%replaced%'
+               OR LOWER(COALESCE(ut_progress,'')) LIKE '%tubing%'
+               OR LOWER(COALESCE(report_issued,'')) LIKE '%tubing%'
+        """).fetchone()[0]
+        actionable_total = max(0, total - excluded)
 
         synced_count = cur.execute("SELECT count(*) FROM refined_plan_items WHERE synced_to_master = 1").fetchone()[0]
         pending_sync = cur.execute("""
@@ -1307,13 +1409,33 @@ def api_get_reconciliation():
               AND (LOWER(ut_progress) LIKE '%done%' OR LOWER(report_issued) LIKE '%done%')
               AND (synced_to_master IS NULL OR synced_to_master = 0)
         """).fetchone()[0]
+
+        # Variance-baseline health: a variance is only meaningful against a real
+        # statutory date. Variances computed against the importer's estimated
+        # 2020-01-01 placeholder (or against no date at all) are noise and are
+        # reported separately so the LATE/AHEAD counts stay trustworthy.
+        stale_baseline = cur.execute("""
+            SELECT count(*) FROM refined_plan_items r
+            JOIN assets a ON r.asset_id = a.id
+            WHERE r.date_variance_days IS NOT NULL
+              AND (a.date_osi_next = ? OR a.date_internal_next = ?)
+        """, (PLACEHOLDER_DATE, PLACEHOLDER_DATE)).fetchone()[0]
+        no_baseline = cur.execute("""
+            SELECT count(*) FROM refined_plan_items r
+            JOIN assets a ON r.asset_id = a.id
+            WHERE r.date_variance_days IS NULL
+              AND a.date_osi_next IS NULL AND a.date_internal_next IS NULL
+        """).fetchone()[0]
         
-        # Omissions: master assets overdue or high risk not in refined plan
+        # Omissions: master assets overdue or high risk not in refined plan.
+        # Approved-deferral assets are already managed under MOC and do not
+        # belong on the 'missed by the campaign' list.
         t_today = today()
         cur.execute("""
             SELECT count(*)
             FROM assets a
             WHERE a.archived = 0
+              AND (a.deferral_status IS NULL OR a.deferral_status != 'Approved')
               AND ((a.date_osi_next IS NOT NULL AND a.date_osi_next < ?) 
                 OR (a.date_internal_next IS NOT NULL AND a.date_internal_next < ?) 
                 OR a.risk_category = 'HIGH')
@@ -1323,6 +1445,8 @@ def api_get_reconciliation():
 
     return {
         "total_items": total,
+        "actionable_items": actionable_total,
+        "excluded_items": excluded,
         "matched_count": matched,
         "unmatched_count": unmatched,
         "match_rate": round(matched / total * 100, 1) if total else 0,
@@ -1330,6 +1454,8 @@ def api_get_reconciliation():
         "delayed_count": delayed,
         "proactive_count": proactive,
         "aligned_count": aligned,
+        "stale_baseline_count": stale_baseline,
+        "no_baseline_count": no_baseline,
         "omitted_overdue_count": omitted_count,
         "synced_count": synced_count,
         "pending_sync_count": pending_sync,
@@ -1337,8 +1463,8 @@ def api_get_reconciliation():
             "ut_done": ut_done,
             "ut_holding": ut_holding,
             "report_issued": rep_issued,
-            "ut_percent": round(ut_done / total * 100, 1) if total else 0,
-            "report_percent": round(rep_issued / total * 100, 1) if total else 0,
+            "ut_percent": round(ut_done / actionable_total * 100, 1) if actionable_total else 0,
+            "report_percent": round(rep_issued / actionable_total * 100, 1) if actionable_total else 0,
         }
     }
 
@@ -1451,6 +1577,9 @@ def api_get_reconciliation_omissions(params=None):
     q = ""
     if params:
         q = params.get("q", [""])[0].strip()
+    # Omissions: master assets overdue or high risk not in refined plan.
+    # Approved-deferral assets are already managed under MOC and do not
+    # belong on the 'missed by the campaign' list.
     t_today = today()
     query = """
         SELECT a.id, a.name, a.tag, a.source_sheet, a.field, a.plant, a.location,
@@ -1458,15 +1587,23 @@ def api_get_reconciliation_omissions(params=None):
                a.operating_pressure, a.remarks
         FROM assets a
         WHERE a.archived = 0
+          AND (a.deferral_status IS NULL OR a.deferral_status != 'Approved')
           AND ((a.date_osi_next IS NOT NULL AND a.date_osi_next < ?) 
             OR (a.date_internal_next IS NOT NULL AND a.date_internal_next < ?) 
             OR a.risk_category = 'HIGH')
           AND a.id NOT IN (SELECT asset_id FROM refined_plan_items WHERE asset_id IS NOT NULL)
-        ORDER BY CASE WHEN a.risk_category = 'HIGH' THEN 1 ELSE 2 END,
-                 COALESCE(a.date_internal_next, a.date_osi_next) ASC
     """
+    args = [t_today, t_today]
+    # Placeholder estimated dates are not real statutory commitments — only
+    # include them in the omission list when the planner asks explicitly.
+    include_estimated = params and params.get("include_estimated", ["0"])[0].strip().lower() in ("1", "true", "yes")
+    if not include_estimated:
+        query += " AND a.date_osi_next != ? AND a.date_internal_next != ?"
+        args.extend([PLACEHOLDER_DATE, PLACEHOLDER_DATE])
+    query += " ORDER BY CASE WHEN a.risk_category = 'HIGH' THEN 1 ELSE 2 END,"
+    query += " COALESCE(a.date_internal_next, a.date_osi_next) ASC"
     with CONN_LOCK:
-        rows = [row_to_dict(r) for r in CONN.execute(query, (t_today, t_today)).fetchall()]
+        rows = [row_to_dict(r) for r in CONN.execute(query, args).fetchall()]
 
     if q:
         fields = [
