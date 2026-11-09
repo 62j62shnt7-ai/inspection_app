@@ -15,3 +15,6 @@ backups/
 /temp_imported_plan.xlsx
 /1. Master Inspection Plan - *.xlsx
 /Master Inspection Plan - Review Queues.xlsx
+
+# Local inspection database
+/inspection_plan.db

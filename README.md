@@ -3,9 +3,9 @@
 A local web app for tracking inspection due dates, overdue items, and
 generating yearly inspection plans — replacing the master Excel workbook.
 
-Your data has already been imported: **`inspection_plan.db`** contains all
-1,420 equipment/piping records from your workbook (Vessels & Tanks, Coolers,
-OP/GP/Turbines Piping, Dead Legs, Critical Assets, and more).
+The app uses a local database, **`inspection_plan.db`**. For a new checkout,
+copy your existing database into the app directory or create one by following
+the Excel import instructions below.
 
 ## Running it (on your Mac, right now)
 
