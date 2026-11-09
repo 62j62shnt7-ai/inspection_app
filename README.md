@@ -78,6 +78,30 @@ python3 import_excel.py "/path/to/workbook.xlsx" inspection_plan.db
 This **overwrites** the database — anything you'd added/edited in the app
 since the last import would be lost, so treat it as a reset, not a sync.
 
+## Creating a lossless Master Register draft
+
+The updated multi-sheet workbook can be copied with a normalized `Master
+Register` sheet added. Original sheets are retained, every non-empty source
+row is represented, and each register row includes its source sheet/row,
+raw source values, and review flags. This generator does not modify the
+source workbook or the database:
+
+```
+python3 build_master_register.py \
+  "/path/to/1. Master Inspection Plan - Updated 25-10-2026.xlsx" \
+  "/path/to/1. Master Inspection Plan - Register Draft.xlsx"
+```
+
+Review rows by filtering `Review Flags`. Asset IDs use the strongest source
+identifier available. Rows without one use a generated ID based on the
+asset name and are marked `ID_FROM_ASSET_NAME_REVIEW`. Treat the reviewed
+register as the one-time migration: retain its Asset ID values and edit the
+Master Register for future updates instead of regenerating it from the old
+source sheets. The generator refuses to overwrite an existing output file
+so it cannot erase review edits. Choose a new output filename for a new
+migration draft. Import only after the mappings and flagged rows have been
+checked.
+
 ## What got imported, and what to double check
 
 - **Fully structured** (all fields mapped): Vessels & TKs, Coolers, OP

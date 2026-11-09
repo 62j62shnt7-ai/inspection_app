@@ -6,3 +6,12 @@ __pycache__/
 *.db-wal
 *.db-shm
 backups/
+
+# Local environment files and generated inspection exports
+.env
+.env.*
+!.env.example
+/outputs/
+/temp_imported_plan.xlsx
+/1. Master Inspection Plan - *.xlsx
+/Master Inspection Plan - Review Queues.xlsx
